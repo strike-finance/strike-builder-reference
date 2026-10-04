@@ -54,6 +54,7 @@ export function detectInstalledWallets(): WalletInfo[] {
     "begin",
     "ctrl",
     "okxwallet",
+    "1am",
   ];
   for (const id of cardanoIds) {
     const ns = (window as any).cardano?.[id];
