@@ -3,9 +3,14 @@ import type { Market, MarginTier } from "../types/market";
 const DEFAULT_MMR = 0.01;
 const DEFAULT_MAX_LEVERAGE = 10;
 
+// Margin tiers come from GET /v2/markets → markets[symbol].margin_tiers.
+// Fallbacks below are for UI rendering before markets load only.
+
 /**
- * Find the applicable margin tier for a given notional value.
- * Tiers are sorted by max_notional ascending; returns first tier where max_notional >= notional.
+ * Find the applicable margin tier for a given notional value (backend
+ * ResolveMarginTierByNotionalHint): the first tier with notional <= max_notional
+ * (a notional exactly on a boundary stays in the lower tier); above the last
+ * tier, the last tier is used. Use the UNROUNDED notional.
  *
  * @example
  *   tiers = [{ max_notional: "50000", ... }, { max_notional: "250000", ... }]
@@ -77,8 +82,10 @@ export function getMaxLeverageForNotional(
 }
 
 /**
- * Max position size (notional) for a given leverage.
- * Finds highest-notional tier whose max_leverage >= leverage.
+ * Max position size (notional) for a given leverage (backend
+ * ResolveMarginTierByLeverageHint): the highest-index tier whose
+ * max_leverage >= leverage. New orders are rejected when
+ * |position size after order| × mark > that tier's max_notional.
  *
  * @example
  *   leverage = 30 -> Tier 1 (max_leverage=50 >= 30) -> max $50,000

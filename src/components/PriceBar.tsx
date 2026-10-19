@@ -12,9 +12,11 @@ interface Props {
 /**
  * Price bar showing mark price, index price, funding rate, and countdown.
  *
- * Funding rate display:
- *   fundingRatePercent = rate * 100  (e.g. 0.0001 -> 0.01%)
- *   annualized = rate * 100 * 3 * 365  (3 funding periods/day)
+ * Funding is paid HOURLY at HH:00 UTC; `r` on markPriceUpdate is the live
+ * hourly rate (the capped 8h rate / 8).
+ *   fundingRatePercent = rate * 100          (e.g. 0.0000125 -> 0.00125% per hour)
+ *   annualized         = rate * 100 * 24 * 365
+ *   payment per position = -signedSize * mark * rate  (positive rate: longs pay)
  *
  * Countdown: nextFundingTime - Date.now() formatted as HH:MM:SS
  */
@@ -50,7 +52,7 @@ export function PriceBar({
   }, [nextFundingTime]);
 
   const fundingPercent = (fundingRate * 100).toFixed(4);
-  const annualized = (fundingRate * 100 * 3 * 365).toFixed(2);
+  const annualized = (fundingRate * 100 * 24 * 365).toFixed(2);
   const fundingColor = fundingRate >= 0 ? "text-green" : "text-red";
 
   return (
@@ -68,7 +70,7 @@ export function PriceBar({
         <span className="value">{formatPrice(indexPrice)}</span>
       </div>
       <div className="price-item">
-        <span className="label">Funding / 8h</span>
+        <span className="label">Funding / 1h</span>
         <span className={`value ${fundingColor}`}>{fundingPercent}%</span>
       </div>
       <div className="price-item">

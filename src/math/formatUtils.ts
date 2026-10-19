@@ -81,19 +81,39 @@ export function formatSize(value: number, basePrec: number = 4): string {
 }
 
 /**
- * Snap a value to the nearest valid step size (floored).
- * @example snapToStep(0.5123, 0.0001, 4) -> 0.5123
- * @example snapToStep(0.5127, 0.001, 3)  -> 0.512
- * @example snapToStep(43001.57, 0.01, 2) -> 43001.57
+ * Floor a value onto the backend's validation grid: value = min + k × step
+ * (k ≥ 0), anchored at the market minimum (pkg/models/market_order_validation_rules.go).
+ *   sizes:  min = order_{limit|market}_min_size, step = order_{limit|market}_step_size
+ *   prices: min = order_min_price, step = order_tick_price
+ * Values below `min` are returned unchanged (validation reports them).
+ * The 1e-9 epsilon absorbs float error (e.g. 0.57 / 0.01 = 56.99999…).
+ *
+ * @example snapToStep(0.57, 0.01, 2)        -> 0.57
+ * @example snapToStep(0.5127, 0.001, 3)     -> 0.512
+ * @example snapToStep(10.7, 1, 1, 0.5)      -> 10.5   (grid 0.5, 1.5, …, 10.5)
+ * `precision` must cover the decimals of both step and min.
  */
 export function snapToStep(
   value: number,
   stepSize: number,
-  precision: number
+  precision: number,
+  min: number = 0
 ): number {
-  if (stepSize <= 0) return value;
-  const snapped = Math.floor(value / stepSize) * stepSize;
-  return parseFloat(snapped.toFixed(precision));
+  if (!(stepSize > 0) || value < min) return value;
+  const k = Math.floor((value - min) / stepSize + 1e-9);
+  return +(min + k * stepSize).toFixed(precision);
+}
+
+/** True when value lies on the grid min + k × step (float tolerant). */
+export function isOnStepGrid(value: number, stepSize: number, min: number = 0): boolean {
+  if (!(stepSize > 0)) return true;
+  const k = (value - min) / stepSize;
+  return k >= -1e-9 && Math.abs(k - Math.round(k)) < 1e-6;
+}
+
+/** Decimal places of a decimal string, e.g. "0.00010" -> 5. */
+export function decimalPlaces(value: string | undefined): number {
+  return (value?.split(".")[1] ?? "").length;
 }
 
 /**
@@ -102,4 +122,24 @@ export function snapToStep(
  */
 export function formatSizeForApi(value: number, basePrec: number): string {
   return Number(value.toFixed(basePrec)).toString();
+}
+
+/**
+ * Round half-to-even ("banker's rounding") to `decimals` places — the rounding
+ * the backend applies to derived values at the market's quote_prec.
+ * Float-based approximation for display; use a decimal library for exact work.
+ * @example roundHalfEven(2.345, 2) -> 2.34   roundHalfEven(2.355, 2) -> 2.36
+ */
+export function roundHalfEven(value: number, decimals: number): number {
+  if (!Number.isFinite(value)) return value;
+  const factor = Math.pow(10, decimals);
+  const scaled = value * factor;
+  const floor = Math.floor(scaled);
+  const diff = scaled - floor;
+  const EPS = 1e-9;
+  let rounded: number;
+  if (diff > 0.5 + EPS) rounded = floor + 1;
+  else if (diff < 0.5 - EPS) rounded = floor;
+  else rounded = floor % 2 === 0 ? floor : floor + 1;
+  return rounded / factor;
 }

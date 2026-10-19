@@ -1,12 +1,19 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { toast } from "react-toastify";
 import { userStream } from "../ws/userStream";
-import { getAccount, getPositions, getOpenOrders } from "../api/account";
-import type { Position } from "../types/position";
-import type { Account } from "../types/account";
+import { getAccount, getPositions, getOpenOrders, getSymbols } from "../api/account";
+import type { Position, PositionResponse } from "../types/position";
+import type { Account, SymbolsResponse } from "../types/account";
+import type { OpenOrder, OrderRow } from "../types/order";
+import {
+  FINAL_ORDER_STATUSES,
+  type AccountUpdateData,
+  type AccountUpdatePosition,
+  type OrderTradeUpdateData,
+} from "../types/ws";
 
 // ═══════════════════════════════════════════════════════════════════
-// CLOSE REASON MAPPING (matches Strike app utils/errors/errorMessageUtils.ts)
+// CLOSE REASON MAPPING (order `cr` / CloseReason strings)
 // ═══════════════════════════════════════════════════════════════════
 
 const CLOSE_REASON_MAP: Record<string, string> = {
@@ -20,128 +27,102 @@ const CLOSE_REASON_MAP: Record<string, string> = {
   order_price_out_of_price_cap: "Order price exceeds price cap",
   order_price_out_of_price_floor: "Order price below price floor",
   order_price_not_multiple_of_tick: "Order price is not a multiple of tick size",
-  order_price_exceeds_maximum: "Order price exceeds maximum",
+  order_would_match_immediately: "Post-only order would match immediately",
+  order_expired_in_match: "Order expired (self-trade prevention)",
   conditional_order_triggers_immediately: "Conditional order would trigger immediately",
   no_open_position: "No open position",
   order_increase_position: "Reduce-only order would increase position",
-  invalid_order: "Invalid order",
-  invalid_order_size: "Invalid order size",
-  invalid_order_price: "Invalid order price",
-  invalid_order_side: "Invalid order side",
-  invalid_order_type: "Invalid order type",
-  invalid_stop_price: "Invalid stop price",
-  stop_price_not_multiple_of_tick: "Stop price is not a multiple of tick size",
-  stop_price_out_of_limit: "Stop price out of limit",
-  order_not_found: "Order not found",
-  order_not_allowed: "Order not allowed",
   liquidation: "Liquidation",
-  invalid_reduce_margin: "Invalid margin reduction",
-  invalid_margin_mode: "Invalid margin mode",
-  slippage_must_be_positive: "Slippage must be positive",
-  slippage_only_for_market_orders: "Slippage only applies to market orders",
 };
 
 function mapCloseReason(reason: string): string {
-  if (!reason) return "Unknown error";
+  if (!reason) return "Order rejected";
   return CLOSE_REASON_MAP[reason.toLowerCase().trim()] ?? reason.replace(/_/g, " ");
 }
 
-// ── Normalize helpers (match Strike app patterns) ──
-
-const toNumber = (value: any): number => {
+const toNumber = (value: unknown): number => {
   const num = typeof value === "string" ? parseFloat(value) : Number(value ?? 0);
   return Number.isFinite(num) ? num : 0;
 };
 
-/** Normalize position from REST API (PascalCase / snake_case mixed) */
-function normalizePositionFromApi(raw: any): Position {
-  const size = toNumber(raw?.Size ?? raw?.size ?? raw?.pa ?? 0);
-  const absoluteSize = Math.abs(size);
-  const sideRaw = String(raw?.Side ?? raw?.positionSide ?? raw?.position_side ?? raw?.ps ?? "long");
-  const positionSide: "LONG" | "SHORT" = sideRaw.toUpperCase() === "SHORT" ? "SHORT" : "LONG";
+// ── Normalizers ──
 
+/** GET /v2/positions row (snake_case, SIGNED size, no side field). */
+function normalizePositionFromApi(raw: PositionResponse): Position {
+  const signed = toNumber(raw.size);
   return {
-    symbol: raw?.symbol || raw?.s || "",
-    size: absoluteSize,
-    entryPrice: toNumber(raw?.EntryPrice ?? raw?.entryPrice ?? raw?.entry_price ?? raw?.ep ?? 0),
-    positionSide,
-    marginMode: (String(raw?.MarginMode ?? raw?.marginMode ?? raw?.margin_mode ?? raw?.mt ?? "cross")).toLowerCase() as "cross" | "isolated",
-    isoBalance: toNumber(raw?.IsolatedMargin ?? raw?.isoBalance ?? raw?.iso_balance ?? raw?.ib ?? 0),
-    leverage: toNumber(raw?.Leverage ?? raw?.leverage ?? 0),
-    accumulatedFundingFees: toNumber(raw?.accumulatedFundingFees ?? raw?.accumulated_funding_fees ?? 0),
-    id: raw?.PositionID || raw?.id || raw?.i || undefined,
-    // Server-computed fields (use as initial values, will be overridden by client-side enrichment)
-    uPnL: toNumber(raw?.upnl ?? 0) || undefined,
-    liquidationPrice: toNumber(raw?.liquidation_price ?? 0) || undefined,
-    maintenanceMargin: toNumber(raw?.maintenance_margin ?? 0) || undefined,
+    symbol: raw.symbol,
+    size: Math.abs(signed),
+    entryPrice: toNumber(raw.entry_price),
+    positionSide: signed < 0 ? "SHORT" : "LONG",
+    marginMode: raw.margin_mode,
+    isoBalance: toNumber(raw.iso_balance),
+    leverage: raw.leverage,
+    accumulatedFundingFees: toNumber(raw.accumulated_funding_fees),
+    id: String(raw.id),
   };
 }
 
-/** Normalize position from WS ACCOUNT_UPDATE (lowercase single-letter keys) */
-function normalizePositionFromWs(raw: any): Position {
+/** WS ACCOUNT_UPDATE data.P[] entry (pa is SIGNED, "0" when closed). */
+function normalizePositionFromWs(raw: AccountUpdatePosition): Position & { seq?: number } {
+  const signed = toNumber(raw.pa);
   return {
-    symbol: String(raw?.s ?? ""),
-    size: Math.abs(toNumber(raw?.pa ?? 0)),
-    entryPrice: toNumber(raw?.ep ?? 0),
-    positionSide: String(raw?.ps ?? "LONG").toUpperCase() === "SHORT" ? "SHORT" : "LONG",
-    marginMode: String(raw?.mt ?? "cross").toLowerCase() as "cross" | "isolated",
-    isoBalance: toNumber(raw?.ib ?? 0),
-    leverage: 0, // Not provided via WS — use from existing or account settings
-    accumulatedFundingFees: 0, // Not provided via WS — preserve from existing
-    id: raw?.i ? String(raw.i) : undefined,
+    symbol: raw.s,
+    size: Math.abs(signed),
+    entryPrice: toNumber(raw.ep),
+    positionSide: signed < 0 ? "SHORT" : "LONG",
+    marginMode: raw.mt,
+    isoBalance: toNumber(raw.ib),
+    leverage: raw.leverage ?? 0,
+    accumulatedFundingFees: toNumber(raw.funding_total),
+    id: raw.position_id ?? (raw.i !== undefined ? String(raw.i) : undefined),
+    seq: raw.position_seq,
   };
 }
 
-/** Merge WS position updates into current positions (same as Strike mergePositions) */
-function mergePositions(current: Position[], updates: Position[]): Position[] {
+/** Merge WS position updates (one-way mode: keyed by symbol; drop on size 0). */
+function mergePositions(
+  current: Position[],
+  updates: (Position & { seq?: number })[],
+  seqs: Map<string, number>
+): Position[] {
   if (!updates.length) return current;
+  const map = new Map(current.map((p) => [p.symbol, p]));
 
-  const map = new Map(current.map((p) => [`${p.symbol}-${p.positionSide}`, p]));
+  for (const { seq, ...update } of updates) {
+    const existing = map.get(update.symbol);
+    // Ignore stale updates (lower position_seq for the same position)
+    const seqKey = `${update.symbol}:${update.id}`;
+    if (seq !== undefined && existing?.id === update.id && seq < (seqs.get(seqKey) ?? 0)) continue;
+    if (seq !== undefined) seqs.set(seqKey, seq);
 
-  for (const update of updates) {
-    const key = `${update.symbol}-${update.positionSide}`;
-
-    if (update.size < 1e-12) {
-      map.delete(key);
+    if (update.size === 0) {
+      map.delete(update.symbol);
     } else {
-      const existing = map.get(key);
-      // Remove opposite side (handles position flips)
-      const oppSide = update.positionSide === "LONG" ? "SHORT" : "LONG";
-      map.delete(`${update.symbol}-${oppSide}`);
-
-      map.set(key, {
+      map.set(update.symbol, {
         ...update,
-        // Preserve fields not sent via WS
-        leverage: existing?.leverage ?? update.leverage,
-        accumulatedFundingFees: existing?.accumulatedFundingFees ?? update.accumulatedFundingFees,
-        id: update.id || existing?.id,
+        leverage: update.leverage || existing?.leverage || 0,
       });
     }
   }
-
   return Array.from(map.values());
 }
 
-/** Normalize order from REST API (PascalCase) to a common format */
-function normalizeOrderFromApi(raw: any): any {
+/** REST open order (PascalCase engine model, lowercase enums) → OrderRow. */
+function normalizeOrderFromApi(raw: OpenOrder): OrderRow {
   return {
-    Id: raw.ID ?? raw.Id ?? raw.id ?? 0,
-    ClientOrderId: raw.ClientOrderID ?? raw.ClientOrderId ?? raw.client_order_id ?? "",
-    Symbol: raw.Symbol ?? raw.symbol ?? "",
-    Side: raw.Side ?? raw.side ?? "",
-    Status: raw.Status ?? raw.status ?? "",
-    Type: raw.Type ?? raw.type ?? "",
-    OriginType: raw.OriginType ?? raw.origin_type ?? "",
-    Size: raw.Size ?? raw.size ?? "0",
-    Price: raw.Price ?? raw.price ?? "0",
-    StopPrice: raw.StopPrice ?? raw.stop_price ?? "0",
-    Filled: raw.Filled ?? raw.filled ?? "0",
-    ReduceOnly: raw.ReduceOnly ?? raw.reduce_only ?? false,
-    PostOnly: raw.PostOnly ?? raw.post_only ?? false,
-    WorkingType: raw.WorkingType ?? raw.working_type ?? "",
-    TimeInForce: raw.TimeInForce ?? raw.time_in_force ?? "GTC",
-    CreateTimestamp: raw.CreateTimestamp ?? raw.create_timestamp ?? raw.EntryTimestamp ?? 0,
-    Strategy: raw.Strategy ?? raw.strategy ?? null,
+    Id: raw.ID,
+    ClientOrderId: raw.ClientOrderID,
+    Symbol: raw.Symbol,
+    Side: String(raw.Side).toUpperCase(),
+    Status: String(raw.Status).toUpperCase(),
+    Type: String(raw.Type).toUpperCase(),
+    Size: raw.Size,
+    Price: raw.Price,
+    StopPrice: raw.StopPrice,
+    Filled: raw.Filled,
+    ReduceOnly: raw.ReduceOnly,
+    CreateTimestamp: raw.CreateTimestamp,
   };
 }
 
@@ -150,26 +131,29 @@ function normalizeOrderFromApi(raw: any): any {
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * User data stream — matches Strike app UserStreamContext pattern:
+ * User data: REST state + /ws/user-api updates.
  *
- * 1. On connect: parallel REST fetch of /v2/account + /v2/positions + /v2/openOrders
- * 2. Subscribe to WS for real-time updates
- * 3. ACCOUNT_UPDATE: update wallet_balance + merge positions
- * 4. ORDER_TRADE_UPDATE: update orders list
- * 5. Toasts on liquidation, ADL, deposit, withdraw, fills
+ * 1. Connect the user stream (session.logon → subscribe "userstream")
+ * 2. On every subscribe ack (initial and after reconnects), reload REST state:
+ *    /v2/account, /v2/symbols, /v2/positions, /v2/openOrders
+ * 3. ACCOUNT_UPDATE: wallet balance (B[0].wb) + positions (P)
+ * 4. ORDER_TRADE_UPDATE: open orders list + fill toasts (fills: t > 0)
  */
 export function useUserStream(accountId: string | null) {
   const [positions, setPositions] = useState<Position[]>([]);
-  const [orders, setOrders] = useState<any[]>([]);
+  const [orders, setOrders] = useState<OrderRow[]>([]);
   const [account, setAccount] = useState<Account | null>(null);
+  const [symbols, setSymbols] = useState<SymbolsResponse | null>(null);
   const [isLoading, setIsLoading] = useState(false);
   const isMountedRef = useRef(true);
+  const positionSeqRef = useRef(new Map<string, number>());
+  const lastWalletRef = useRef<number | null>(null);
 
-  // Toast deduplication cache (matches Strike app processedOrderUpdatesRef)
+  // Toast deduplication cache
   const toastCacheRef = useRef<Map<string, number>>(new Map());
 
-  // Order update buffer — 300ms batching for replace-order (cancel + new)
-  const orderBufferRef = useRef<any[]>([]);
+  // Order update buffer — 300ms batching (replace = cancel + new)
+  const orderBufferRef = useRef<OrderTradeUpdateData[]>([]);
   const orderFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
@@ -183,271 +167,215 @@ export function useUserStream(accountId: string | null) {
     };
   }, []);
 
-  // ── ORDER_TRADE_UPDATE toast (matches Strike app processOrderTradeUpdate) ──
-  const showOrderToast = useCallback((event: any) => {
-    const orderId = event.i ?? event.orderID ?? 0;
-    const status = (event.X ?? event.orderStatus ?? "").toUpperCase();
-    const symbol = event.s ?? event.symbol ?? "";
-    const cr = event.cr ?? "";
+  const loadRest = useCallback(async () => {
+    setIsLoading(true);
+    const [acc, syms, pos, ords] = await Promise.all([
+      getAccount().catch((e) => { console.error("[useUserStream] getAccount failed:", e); return null; }),
+      getSymbols().catch((e) => { console.error("[useUserStream] getSymbols failed:", e); return null; }),
+      getPositions().catch((e) => { console.error("[useUserStream] getPositions failed:", e); return null; }),
+      getOpenOrders().catch((e) => { console.error("[useUserStream] getOpenOrders failed:", e); return null; }),
+    ]);
+    if (!isMountedRef.current) return;
+    if (acc) {
+      setAccount(acc);
+      lastWalletRef.current = toNumber(acc.wallet_balance);
+    }
+    if (syms) setSymbols(syms);
+    if (pos) setPositions(pos.map(normalizePositionFromApi));
+    if (ords) setOrders(ords.map(normalizeOrderFromApi));
+    setIsLoading(false);
+  }, []);
 
-    const tradeId = event.t ?? 0;
-    const lastFilledQty = event.l ?? "";
-    const lastFilledPrice = event.L ?? "";
-    const fee = event.n ?? "";
+  /** Re-read effective symbol settings (e.g. after a leverage / margin mode change). */
+  const refreshSymbols = useCallback(() => {
+    getSymbols().then((s) => isMountedRef.current && setSymbols(s)).catch(() => {});
+  }, []);
 
-    // Fill-data guard: only show fill toasts when we have actual fill data
-    // (prevents duplicates when backend sends preview + actual fill messages)
-    const hasFillFields = tradeId > 0 || lastFilledQty || lastFilledPrice || fee;
-    const isFillStatus = status === "FILLED" || status === "PARTIALLY_FILLED";
+  // ── ORDER_TRADE_UPDATE toasts ──
+  const showOrderToast = useCallback((d: OrderTradeUpdateData) => {
+    const status = (d.X ?? "").toUpperCase();
+    const isFill = d.t > 0; // only fill updates carry a trade ID
+    if (!isFill && status !== "REJECTED" && status !== "CANCELED") return;
 
-    const shouldShowToast =
-      (isFillStatus && hasFillFields) ||
-      status === "REJECTED" ||
-      status === "CANCELED" ||
-      status === "CANCELLED";
-
-    if (!shouldShowToast) return;
-
-    // Deduplication by orderId + status
-    const key = `${orderId}-${status}`;
+    const key = isFill ? `fill-${d.t}-${d.i}` : `${d.i}-${status}`;
     const cache = toastCacheRef.current;
     if (cache.has(key)) return;
     cache.set(key, Date.now());
-    // Prune old entries
     if (cache.size > 200) {
       const cutoff = Date.now() - 60000;
       for (const [k, ts] of cache) if (ts < cutoff) cache.delete(k);
     }
 
-    // Format toast — matching Strike app orderNotificationHandler.ts exactly
-    const side = (event.S ?? "").toUpperCase() === "BUY" ? "Buy" : "Sell";
-
-    if (status === "REJECTED") {
-      toast.error(mapCloseReason(cr || "unknown_error"));
-    } else if (status === "FILLED" || status === "PARTIALLY_FILLED") {
-      // Use last fill fields, fall back to cumulative/order qty
-      const qty = (lastFilledQty && parseFloat(lastFilledQty) > 0 ? lastFilledQty : "") ||
-        (event.z && parseFloat(event.z) > 0 ? event.z : "") ||
-        (event.q ?? "0");
-      const price = (lastFilledPrice && parseFloat(lastFilledPrice) > 0 ? lastFilledPrice : "") ||
-        (event.p && parseFloat(event.p) > 0 ? event.p : "");
-
-      if (price && parseFloat(price) > 0) {
-        toast.success(`Order Filled: ${side} ${qty} ${symbol} at $${parseFloat(price).toFixed(4)}`);
-      } else {
-        toast.success(`Order Filled: ${side} ${qty} ${symbol}`);
-      }
-    } else if (status === "CANCELED" || status === "CANCELLED") {
-      // Slippage exceeded = error toast (matches Strike app)
-      if (cr === "market_order_exceeded_slippage") {
-        toast.error(mapCloseReason(cr));
-      } else {
-        const qty = event.q ?? "0";
-        toast.success(`Order Cancelled: ${side} ${qty} ${symbol}`);
-      }
+    const side = d.S === "BUY" ? "Buy" : "Sell";
+    if (isFill) {
+      const price = parseFloat(d.L);
+      toast.success(`Filled: ${side} ${d.l} ${d.s} at $${Number.isFinite(price) ? price : d.L} (fee ${d.n})`);
+    } else if (status === "REJECTED") {
+      toast.error(mapCloseReason(d.cr));
+    } else if (d.cr === "market_order_exceeded_slippage") {
+      toast.error(mapCloseReason(d.cr));
+    } else {
+      toast.success(`Order Cancelled: ${side} ${d.q} ${d.s}`);
     }
   }, []);
 
   // ── Buffered order state update (300ms batching) ──
-  const bufferOrderUpdate = useCallback((event: any) => {
-    orderBufferRef.current.push(event);
+  const bufferOrderUpdate = useCallback((d: OrderTradeUpdateData) => {
+    orderBufferRef.current.push(d);
     if (!orderFlushTimerRef.current) {
       orderFlushTimerRef.current = setTimeout(() => {
         const batch = orderBufferRef.current.splice(0);
         orderFlushTimerRef.current = null;
         if (batch.length === 0) return;
-
-        setOrders((prev) => {
-          let result = prev;
-          for (const evt of batch) {
-            result = applyOrderUpdate(result, evt);
-          }
-          return result;
-        });
+        setOrders((prev) => batch.reduce(applyOrderUpdate, prev));
       }, 300);
     }
   }, []);
 
-  // ── Step 1: Fetch initial data via REST ──
+  // ── WS: connect, then load REST after each subscribe ack ──
   useEffect(() => {
     if (!accountId) {
       setAccount(null);
+      setSymbols(null);
       setPositions([]);
       setOrders([]);
       return;
     }
 
-    setIsLoading(true);
-
-    Promise.all([
-      getAccount().catch((e) => { console.error("[useUserStream] getAccount failed:", e); return null; }),
-      getPositions().catch((e) => { console.error("[useUserStream] getPositions failed:", e); return []; }),
-      getOpenOrders().catch((e) => { console.error("[useUserStream] getOpenOrders failed:", e); return []; }),
-    ]).then(([acc, pos, ords]) => {
-      if (!isMountedRef.current) return;
-
-      if (acc) {
-        console.log("[useUserStream] Account loaded:", acc.account_id, "balance:", acc.wallet_balance);
-        setAccount(acc);
-      }
-
-      if (Array.isArray(pos)) {
-        const normalized = pos.map(normalizePositionFromApi);
-        console.log("[useUserStream] Positions loaded:", normalized.length);
-        setPositions(normalized);
-      }
-
-      if (Array.isArray(ords)) {
-        const normalized = ords.map(normalizeOrderFromApi);
-        console.log("[useUserStream] Open orders loaded:", normalized.length);
-        setOrders(normalized);
-      }
-
-      setIsLoading(false);
+    const unsubSubscribed = userStream.on("subscribed", () => {
+      if (isMountedRef.current) loadRest();
     });
-  }, [accountId]);
 
-  // ── Step 2: Connect WS for real-time updates ──
-  useEffect(() => {
-    if (!accountId) return;
+    const unsubAccount = userStream.on("ACCOUNT_UPDATE", (data: any) => {
+      if (!isMountedRef.current || !data) return;
 
-    userStream.connect(accountId);
-
-    // ACCOUNT_UPDATE handler (matches Strike app handleAccountUpdateMessage)
-    const unsubAccount = userStream.on("ACCOUNT_UPDATE", (event: any) => {
-      if (!isMountedRef.current) return;
-
-      // Update wallet_balance
-      const primaryBalance = event.B?.[0]?.wb;
-      if (primaryBalance !== undefined && primaryBalance !== null) {
-        setAccount((prev) =>
-          prev ? { ...prev, wallet_balance: String(primaryBalance) } : prev
-        );
+      // Wrapped async outcomes: { event_type, event_data }
+      if (data.event_type) {
+        const ev = data.event_type as string;
+        if (ev === "LEVERAGE_UPDATED" || ev === "MARGIN_UPDATED") refreshSymbols();
+        if (ev.endsWith("_FAILED")) toast.error(`${ev}: ${String(data.event_data?.error ?? "")}`);
+        return;
       }
 
-      // Merge position updates
-      const rawPositions = event.P ?? [];
-      if (rawPositions.length > 0) {
-        const updates = rawPositions.map(normalizePositionFromWs);
-        setPositions((prev) => mergePositions(prev, updates));
+      const d = data as AccountUpdateData;
+
+      // Wallet balance (balance + position updates carry B[0].wb)
+      // (bc is always "0", so a deposit amount is derived from the wb delta)
+      const wb = d.B?.[0]?.wb;
+      if (wb !== undefined) {
+        const prevWallet = lastWalletRef.current;
+        lastWalletRef.current = toNumber(wb);
+        if (d.e === "DEPOSIT" && prevWallet !== null && toNumber(wb) > prevWallet) {
+          toast.success(`Deposit credited: +$${(toNumber(wb) - prevWallet).toFixed(2)}`);
+        }
+        setAccount((prev) => (prev ? { ...prev, wallet_balance: String(wb) } : prev));
       }
 
-      // Reason — matches Strike app: reads r, EventReasonType, eventReasonType, reason, e, m
-      // The "m" field matches Go struct AccountUpdateData.EventReasonType json:"m"
-      const reason = String(
-        event.r ?? event.EventReasonType ?? event.eventReasonType ??
-        event.reason ?? event.m ?? ""
-      ).toUpperCase();
-
-      if (reason === "DEPOSIT") {
-        const bc = event.B?.[0]?.bc;
-        const amount = bc ? parseFloat(bc) : 0;
-        if (amount > 0) toast.success(`Deposit received: +$${amount.toFixed(2)}`);
-      }
-      if (reason === "WITHDRAW" || reason === "WITHDRAWAL_SETTLED") {
-        const bc = event.B?.[0]?.bc;
-        const amount = bc ? Math.abs(parseFloat(bc)) : 0;
-        if (amount > 0) toast.success(`Withdrawal processed: $${amount.toFixed(2)}`);
-      }
-      if (reason === "WITHDRAWAL_FAILED") {
-        toast.error("Withdrawal failed");
+      // Positions
+      if (d.P?.length) {
+        const updates = d.P.map(normalizePositionFromWs);
+        setPositions((prev) => mergePositions(prev, updates, positionSeqRef.current));
       }
 
-      // Liquidation / ADL (matches Strike app exactly)
-      const symbols = (event.P ?? [])
-        .map((p: any) => String(p?.s ?? ""))
-        .filter(Boolean);
-      const symbol = symbols[0] || "position";
-
-      if (reason === "PARTIAL_LIQUIDATED") {
-        toast.error(`Your ${symbol} position was partially liquidated`);
-      }
-      if (reason === "FULLY_LIQUIDATED") {
-        toast.error(`Your ${symbol} position was fully liquidated`);
-      }
-      if (reason === "ADL") {
-        toast.error(`Your ${symbol} position was auto-deleveraged`);
+      // data.e is the reason type
+      const symbol = d.P?.[0]?.s || "position";
+      switch (d.e) {
+        case "PARTIAL_LIQUIDATED":
+          toast.error(`Your ${symbol} position was partially liquidated`);
+          break;
+        case "FULLY_LIQUIDATED":
+          toast.error(`Your ${symbol} position was fully liquidated`);
+          break;
+        case "ADL":
+          toast.error(`Your ${symbol} position was auto-deleveraged`);
+          break;
+        case "DEPOSIT_PENDING":
+          toast.info("Deposit detected on-chain, awaiting confirmations");
+          break;
+        case "DEPOSIT_FAILED":
+          toast.error("Deposit failed");
+          break;
+        case "WITHDRAWAL_SETTLED":
+          toast.success(`Withdrawal settled${d.th ? ` (tx ${d.th.slice(0, 10)}…)` : ""}`);
+          break;
+        case "WITHDRAWAL_FAILED":
+          toast.error("Withdrawal failed");
+          break;
       }
     });
 
-    // ORDER_TRADE_UPDATE handler (matches Strike app handleOrderTradeUpdateMessage)
-    const unsubOrder = userStream.on("ORDER_TRADE_UPDATE", (event: any) => {
-      if (!isMountedRef.current) return;
-
-      // Show toast (with dedup + fill-data guard)
-      showOrderToast(event);
-
-      // Buffer order state update (300ms batch for replace-order atomicity)
-      bufferOrderUpdate(event);
+    const unsubOrder = userStream.on("ORDER_TRADE_UPDATE", (data: OrderTradeUpdateData) => {
+      if (!isMountedRef.current || !data) return;
+      showOrderToast(data);
+      bufferOrderUpdate(data);
     });
+
+    userStream.connect();
 
     return () => {
+      unsubSubscribed();
       unsubAccount();
       unsubOrder();
       userStream.disconnect();
     };
-  }, [accountId, showOrderToast, bufferOrderUpdate]);
+  }, [accountId, loadRest, refreshSymbols, showOrderToast, bufferOrderUpdate]);
 
-  // Derived wallet balance from account object
   const walletBalance = account ? parseFloat(account.wallet_balance || "0") : 0;
 
-  return { positions, orders, walletBalance, account, isLoading };
+  return { positions, orders, walletBalance, account, symbols, refreshSymbols, isLoading };
 }
 
 // ═══════════════════════════════════════════════════════════════════
-// ORDER STATE UPDATE (matches Strike app applyOrderTradeUpdate)
+// ORDER STATE UPDATE
 // ═══════════════════════════════════════════════════════════════════
 
-const FINAL = new Set(["FILLED", "CANCELED", "CANCELLED", "REJECTED", "EXPIRED"]);
+/** WS order type names (Binance-style) → REST names, uppercased. */
+const WS_TYPE_TO_REST: Record<string, string> = {
+  MARKET: "MARKET",
+  LIMIT: "LIMIT",
+  STOP_MARKET: "STOP",
+  STOP: "STOP_LIMIT",
+  TAKE_PROFIT_MARKET: "TAKE_PROFIT",
+  TAKE_PROFIT: "TAKE_PROFIT_LIMIT",
+  TRAILING_STOP_MARKET: "TRAILING_STOP_MARKET",
+};
 
-function applyOrderUpdate(currentOrders: any[], event: any): any[] {
-  const orderId = event.i ?? event.orderID ?? 0;
-  const clientOrderId = event.c ?? "";
-  const status = String(event.X ?? event.orderStatus ?? "").toUpperCase();
-
-  // Find by orderId or clientOrderId
-  const index = currentOrders.findIndex(
-    (o) => o.Id === orderId || (clientOrderId && o.ClientOrderId === clientOrderId)
+function applyOrderUpdate(current: OrderRow[], d: OrderTradeUpdateData): OrderRow[] {
+  const status = String(d.X ?? "").toUpperCase();
+  const index = current.findIndex(
+    (o) => o.Id === d.i || (d.c && o.ClientOrderId === d.c)
   );
 
-  if (index === -1) {
-    // Not in list — only add if not a final status
-    if (FINAL.has(status)) return currentOrders;
-
-    return [buildOrderData(event, status), ...currentOrders];
-  }
-
-  // Final status: remove from open orders
-  if (FINAL.has(status)) {
-    const updated = [...currentOrders];
-    updated.splice(index, 1);
+  // Fill updates (t > 0) only carry the fill; the order update that follows has the new z / X.
+  if (d.t > 0) {
+    if (index === -1) return current;
+    if (FINAL_ORDER_STATUSES.has(status)) return current.filter((_, i) => i !== index);
+    const updated = [...current];
+    updated[index] = { ...updated[index], Filled: d.z || updated[index].Filled };
     return updated;
   }
 
-  // Update existing
-  const updated = [...currentOrders];
-  updated[index] = { ...updated[index], ...buildOrderData(event, status) };
-  return updated;
-}
+  if (FINAL_ORDER_STATUSES.has(status)) {
+    return index === -1 ? current : current.filter((_, i) => i !== index);
+  }
 
-function buildOrderData(event: any, status: string): any {
-  return {
-    Id: event.i ?? event.orderID ?? 0,
-    ClientOrderId: event.c ?? "",
-    Symbol: event.s ?? event.symbol ?? "",
-    Side: event.S ?? "",
-    Status: status.toLowerCase(),
-    Type: event.o ?? "",
-    OriginType: event.ot ?? "",
-    Size: event.q ?? "0",
-    Price: event.p ?? "0",
-    StopPrice: event.sp ?? "0",
-    Filled: event.z ?? "0",
-    ReduceOnly: event.R ?? false,
-    WorkingType: event.wt ?? "",
-    CloseReason: event.cr ?? "",
-    CallbackRate: event.CR ?? "",
-    ActivationPrice: event.AP ?? "",
-    CreateTimestamp: event.T ?? event.E ?? 0,
+  const row: OrderRow = {
+    Id: d.i,
+    ClientOrderId: d.c,
+    Symbol: d.s,
+    Side: d.S,
+    Status: status, // NEW | OPEN
+    Type: WS_TYPE_TO_REST[d.o] ?? d.o,
+    Size: d.q,
+    Price: d.p,
+    StopPrice: d.sp,
+    Filled: d.z,
+    ReduceOnly: d.R,
+    CreateTimestamp: index === -1 ? d.T : current[index].CreateTimestamp,
   };
+
+  if (index === -1) return [row, ...current];
+  const updated = [...current];
+  updated[index] = row;
+  return updated;
 }

@@ -10,12 +10,15 @@ import {
   formatSize,
 } from "../math/formatUtils";
 import { ClosePositionModal } from "./ClosePositionModal";
+import type { FeeRates } from "../math/fees";
 
 interface Props {
   positions: Position[];
   basePrec?: number;
   markets?: Record<string, Market>;
   prices?: Record<string, MarkPriceUpdate>;
+  feeRates: FeeRates;
+  builderFeeBps: number;
 }
 
 /**
@@ -23,8 +26,18 @@ interface Props {
  *
  * Columns:
  *   Symbol | Side | Leverage | Size | Entry | Mark | Liq. Price | Margin | PnL (ROE%) | Funding | Close
+ *
+ * Margin: isolated → iso_balance; cross → initial margin (notional / leverage).
+ * ROE% is a UI value (uPnL / (entry × size / leverage)); the backend serves no open-position ROE.
  */
-export function PositionsTable({ positions, basePrec = 4, markets = {}, prices = {} }: Props) {
+export function PositionsTable({
+  positions,
+  basePrec = 4,
+  markets = {},
+  prices = {},
+  feeRates,
+  builderFeeBps,
+}: Props) {
   const [closingPosition, setClosingPosition] = useState<Position | null>(null);
 
   if (positions.length === 0) {
@@ -38,9 +51,7 @@ export function PositionsTable({ positions, basePrec = 4, markets = {}, prices =
 
   const closingMarket = closingPosition ? markets[closingPosition.symbol] ?? null : null;
   const closingPriceData = closingPosition ? prices[closingPosition.symbol] : null;
-  const closingMarkPrice = closingPriceData
-    ? parseFloat(closingPriceData.p || closingPriceData.i || "0")
-    : 0;
+  const closingMarkPrice = closingPriceData ? parseFloat(closingPriceData.p) : 0;
 
   return (
     <div className="panel">
@@ -67,7 +78,7 @@ export function PositionsTable({ positions, basePrec = 4, markets = {}, prices =
               <PositionRow
                 key={`${p.symbol}-${p.positionSide}`}
                 position={p}
-                basePrec={basePrec}
+                basePrec={markets[p.symbol]?.base_prec ?? basePrec}
                 onClose={() => setClosingPosition(p)}
               />
             ))}
@@ -81,6 +92,8 @@ export function PositionsTable({ positions, basePrec = 4, markets = {}, prices =
           market={closingMarket}
           markPrice={closingMarkPrice}
           onClose={() => setClosingPosition(null)}
+          feeRates={feeRates}
+          builderFeeBps={builderFeeBps}
         />
       )}
     </div>

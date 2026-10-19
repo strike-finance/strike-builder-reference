@@ -3,10 +3,13 @@ import { toast } from "react-toastify";
 import type { OrderBookDepthResponse, Market } from "../types/market";
 import type { Position } from "../types/position";
 import type { Account } from "../types/account";
+import type { FeeRates } from "../math/fees";
+import { estimateCommission, estimateBuilderFee } from "../math/fees";
 import { estimateMarketFillPrice } from "../math/orderBookUtils";
 import { getMaxLeverage } from "../math/marginTiers";
-import { formatPrice, formatCurrency, snapToStep, formatSizeForApi } from "../math/formatUtils";
+import { formatPrice, formatCurrency, snapToStep, formatSizeForApi, decimalPlaces } from "../math/formatUtils";
 import { placeOrder, updateLeverage, updateMarginMode } from "../api/orders";
+import type { CreateOrderRequest } from "../types/order";
 import { useOrderValidation } from "../hooks/useOrderValidation";
 import { estimateOrderLiquidationPrice } from "../math/positionCalculations";
 
@@ -19,6 +22,11 @@ interface Props {
   availableBalance: number;
   accountId: string | null;
   account: Account | null;
+  // Effective settings for this symbol from GET /v2/symbols
+  symbolSetting?: { margin_mode: "cross" | "isolated"; leverage: number };
+  onSettingsChanged?: () => void;
+  feeRates: FeeRates;
+  builderFeeBps: number; // sent as X-Builder-Fee-Bps
 }
 
 /**
@@ -40,7 +48,9 @@ interface Props {
  *  ──────────────────────
  *  [ Long BTC-USD ]                   <- submit (shows validation error if invalid)
  *
- * Builder fees are handled server-side based on max_fee_bps from connect flow.
+ * Builder fee: each order sends X-Builder-Fee-Bps (≤ the user's approved
+ * fee_share_bps); omitted/0 = no builder fee. It is charged per fill as
+ * floor(notional × bps / 10000, 2) on top of the trading commission.
  */
 export function OrderForm({
   symbol,
@@ -51,6 +61,10 @@ export function OrderForm({
   availableBalance,
   accountId,
   account,
+  symbolSetting,
+  onSettingsChanged,
+  feeRates,
+  builderFeeBps,
 }: Props) {
   const [side, setSide] = useState<"Long" | "Short">("Long");
   const [orderType, setOrderType] = useState<"market" | "limit">("market");
@@ -59,35 +73,33 @@ export function OrderForm({
   const [reduceOnly, setReduceOnly] = useState(false);
   const [loading, setLoading] = useState(false);
 
-  // ── Margin mode & leverage from account symbol_settings ──
-  const symbolSettings = account?.symbol_settings?.[symbol];
+  // ── Margin mode & leverage: effective settings from GET /v2/symbols ──
   const [marginMode, setMarginMode] = useState<"Cross" | "Isolated">(
-    symbolSettings?.margin_mode === "isolated" ? "Isolated" : "Cross"
+    symbolSetting?.margin_mode === "isolated" ? "Isolated" : "Cross"
   );
   const [leverage, setLeverage] = useState(
-    symbolSettings?.leverage ?? market?.default_leverage ?? 20
+    symbolSetting?.leverage ?? market?.default_leverage ?? 20
   );
   const [showLeverageModal, setShowLeverageModal] = useState(false);
   const [showMarginModal, setShowMarginModal] = useState(false);
   const [tempLeverage, setTempLeverage] = useState(leverage);
 
-  // Sync from account settings when they change
+  // Sync when the effective settings change
   useEffect(() => {
-    if (symbolSettings) {
-      setMarginMode(symbolSettings.margin_mode === "isolated" ? "Isolated" : "Cross");
-      setLeverage(symbolSettings.leverage);
+    if (symbolSetting) {
+      setMarginMode(symbolSetting.margin_mode === "isolated" ? "Isolated" : "Cross");
+      setLeverage(symbolSetting.leverage);
     } else if (market) {
       setLeverage(market.default_leverage);
     }
-  }, [symbolSettings, market]);
+  }, [symbolSetting?.margin_mode, symbolSetting?.leverage, market]);
 
   const maxLeverage = getMaxLeverage(market);
   const sizeNum = parseFloat(size) || 0;
   const limitPriceNum = parseFloat(limitPrice) || 0;
   const basePrec = market?.base_prec ?? 4;
   const baseAsset = market?.base_asset ?? symbol.split("-")[0];
-  const takerRate = 0.0005;
-  const makerRate = 0.0002;
+  const quotePrec = market?.quote_prec ?? 8;
 
   // ── Best bid/ask from depth ──
   const bestBid = useMemo(() => {
@@ -99,7 +111,8 @@ export function OrderForm({
     return parseFloat(depth.asks[0][0]);
   }, [depth]);
 
-  // ── Assuming Price (matches Strike app — side-dependent, matches backend margin calc) ──
+  // ── Assuming price (backend Order.MarketAssumingPrice): limit → price;
+  //    market buy → bestAsk × 1.0005; market sell → max(bestBid, mark) ──
   const assumingPrice = useMemo(() => {
     if (orderType === "limit") {
       return limitPriceNum || null;
@@ -112,7 +125,7 @@ export function OrderForm({
     }
   }, [orderType, side, limitPriceNum, bestAsk, bestBid, markPrice]);
 
-  // ── Open loss per unit (cost of assuming price vs mark price) ──
+  // ── OpenLoss per unit = max(0, dir × (price − mark)) ──
   const openLossPerUnit = useMemo(() => {
     if (!assumingPrice || !markPrice) return 0;
     if (side === "Long") return Math.max(0, assumingPrice - markPrice);
@@ -132,7 +145,9 @@ export function OrderForm({
     availableBalance,
     positions,
     symbol,
+    assumedPrice: assumingPrice ?? undefined,
     openLossPerUnit,
+    allowPreTrade: account?.symbol_settings?.[symbol]?.allow_pre_trade ?? false,
   });
 
   // ── Immediate liquidation check (matches Strike app NewPerpetualContract) ──
@@ -149,6 +164,7 @@ export function OrderForm({
       marginMode,
       walletBalance: parseFloat(account?.wallet_balance || "0"),
       positions,
+      symbol,
     });
 
     if (liqPrice === null || liqPrice <= 0) return false;
@@ -183,8 +199,11 @@ export function OrderForm({
   // ── Calculations ──
   const assumedPrice = estimatedEntry ?? markPrice;
   const orderValue = sizeNum > 0 && assumedPrice > 0 ? sizeNum * assumedPrice : null;
-  const feeRate = orderType === "market" ? takerRate : makerRate;
-  const estimatedFee = orderValue ? orderValue * feeRate : null;
+  // Market orders take; a resting limit order makes (it may also take if it crosses)
+  const feeRate = orderType === "market" ? feeRates.takerRate : feeRates.makerRate;
+  const estimatedFee = orderValue
+    ? estimateCommission(orderValue, feeRate, quotePrec) + estimateBuilderFee(orderValue, builderFeeBps)
+    : null;
 
   const existingPosition = positions.find((p) => p.symbol === symbol);
   const oppositeSize =
@@ -197,7 +216,7 @@ export function OrderForm({
   const openingNotional = openingSize * assumedPrice;
   const marginRequired = leverage > 0 ? openingNotional / leverage : 0;
 
-  const costPerUnit = assumedPrice > 0 && leverage > 0 ? assumedPrice / leverage : 0;
+  const costPerUnit = assumedPrice > 0 && leverage > 0 ? assumedPrice / leverage + openLossPerUnit : 0;
   const maxOpeningSize = costPerUnit > 0 ? availableBalance / costPerUnit : 0;
   const maxSize = oppositeSize + maxOpeningSize;
 
@@ -215,10 +234,12 @@ export function OrderForm({
   const handleLeverageConfirm = async () => {
     if (!accountId) return;
     try {
+      // Async: the engine confirms via ACCOUNT_UPDATE LEVERAGE_UPDATED / LEVERAGE_UPDATE_FAILED
       await updateLeverage(symbol, tempLeverage);
       setLeverage(tempLeverage);
       setShowLeverageModal(false);
-      toast.success(`Leverage set to ${tempLeverage}x`);
+      toast.success(`Leverage update to ${tempLeverage}x submitted`);
+      setTimeout(() => onSettingsChanged?.(), 1000);
     } catch (e: any) {
       toast.error(e.message || "Failed to update leverage");
     }
@@ -232,6 +253,7 @@ export function OrderForm({
       setMarginMode(mode);
       setShowMarginModal(false);
       toast.success(`Margin mode set to ${mode}`);
+      setTimeout(() => onSettingsChanged?.(), 1000);
     } catch (e: any) {
       toast.error(e.message || "Failed to update margin mode");
     }
@@ -242,24 +264,30 @@ export function OrderForm({
     if (!isValid || sizeNum <= 0) return;
     setLoading(true);
     try {
-      const stepSize = parseFloat(market?.order_market_step_size ?? "0.0001");
-      const tickSize = parseFloat(market?.order_tick_price ?? "0.01");
+      // Grids are anchored at the market minimum: value = min + k × step
+      const isLimit = orderType === "limit";
+      const stepSize = parseFloat((isLimit ? market?.order_limit_step_size : market?.order_market_step_size) ?? "0");
+      const minSize = parseFloat((isLimit ? market?.order_limit_min_size : market?.order_market_min_size) ?? "0");
+      const tickSize = parseFloat(market?.order_tick_price ?? "0");
+      const minPrice = parseFloat(market?.order_min_price ?? "0");
+      const pricePrec = decimalPlaces(market?.order_tick_price);
 
-      const request: any = {
+      const request: CreateOrderRequest = {
         symbol,
         side: side === "Long" ? "buy" : "sell",
         type: orderType,
-        size: formatSizeForApi(snapToStep(sizeNum, stepSize, basePrec), basePrec),
+        size: formatSizeForApi(snapToStep(sizeNum, stepSize, basePrec, minSize), basePrec),
         ...(reduceOnly && { reduce_only: true }),
       };
 
       if (orderType === "limit" && limitPriceNum > 0) {
-        request.price = snapToStep(limitPriceNum, tickSize, 2).toString();
+        request.price = snapToStep(limitPriceNum, tickSize, pricePrec, minPrice).toString();
         request.time_in_force = "GTC";
       }
 
-      await placeOrder(request);
-      toast.success("Order submitted");
+      // 201 = sequenced (status "pending"); fills/rejects arrive on the user stream
+      await placeOrder(request, builderFeeBps);
+      toast.success("Order submitted (pending)");
       setSize("");
       setLimitPrice("");
     } catch (e: any) {
@@ -389,9 +417,11 @@ export function OrderForm({
             <span>{formatCurrency(marginRequired)}</span>
           </div>
         )}
-        {estimatedFee && (
+        {estimatedFee !== null && (
           <div className="detail-row">
-            <span>Est. Fee ({(feeRate * 100).toFixed(3)}%)</span>
+            <span>
+              Est. Fee ({(feeRate * 100).toFixed(4)}%{builderFeeBps > 0 ? ` + ${builderFeeBps} bps builder` : ""})
+            </span>
             <span>{formatCurrency(estimatedFee)}</span>
           </div>
         )}

@@ -1,13 +1,20 @@
 import type { Position, CrossLiquidationContext } from "../types/position";
 import type { Market } from "../types/market";
 import { getMMR, getMaintenanceAmount } from "./marginTiers";
+import { roundHalfEven } from "./formatUtils";
+
+// Mirrors pkg/models/position.go (derived fields) and pkg/models/margin.go
+// (margin profiles, bankruptcy/liquidation price). Floats are used for
+// display; the backend uses exact decimals.
+
+const quotePrec = (market?: Market | null) => market?.quote_prec ?? 8;
 
 // ═══════════════════════════════════════════════════════════════════
 // LIQUIDATION PRICE
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * Liquidation price for an ISOLATED position.
+ * Liquidation price for an ISOLATED position (profile W = iso_balance, TU = TM = 0).
  *
  * Formula:
  *   LP = (EP - (IsoBalance + MA) / Size) / (1 - Direction * MMR)
@@ -15,18 +22,18 @@ import { getMMR, getMaintenanceAmount } from "./marginTiers";
  * @param entryPrice  - Entry price
  * @param size        - SIGNED size (+0.5 for Long, -0.5 for Short)
  * @param isoBalance  - Isolated margin balance
- * @param mmr         - Maintenance Margin Rate (e.g. 0.004)
- * @param ma          - Maintenance Amount from tier (e.g. 0 or 50)
+ * @param mmr         - Maintenance Margin Rate of the position's current tier
+ * @param ma          - Maintenance Amount of that tier
+ * @returns LP, or 0 when the result is <= 0 (no liquidation price). Not rounded.
  *
  * @example Long 0.5 BTC at $43,000, isoBalance=$1,075, mmr=0.004, ma=0:
- *   numerator = 43000 - (1075 + 0) / 0.5 = 43000 - 2150 = 40850
+ *   numerator = 43000 - (1075 + 0) / 0.5 = 40850
  *   denominator = 1 - 1 * 0.004 = 0.996
  *   LP = 40850 / 0.996 = $41,014.06
  *
  * @example Short 0.5 BTC at $43,000, isoBalance=$1,075, mmr=0.004, ma=0:
- *   size = -0.5, direction = -1
- *   numerator = 43000 - (1075 + 0) / (-0.5) = 43000 + 2150 = 45150
- *   denominator = 1 - (-1) * 0.004 = 1.004
+ *   numerator = 43000 - (1075 + 0) / (-0.5) = 45150
+ *   denominator = 1 + 0.004 = 1.004
  *   LP = 45150 / 1.004 = $44,960.16
  */
 export function calculateIsolatedLiquidationPrice(
@@ -37,21 +44,9 @@ export function calculateIsolatedLiquidationPrice(
   ma: number = 0
 ): number {
   if (size === 0) return 0;
-
   const direction = size > 0 ? 1 : -1;
-  const numerator = entryPrice - (isoBalance + ma) / size;
-  const denominator = 1 - direction * mmr;
-
-  if (denominator === 0) return 0;
-
-  const lp = numerator / denominator;
-
-  // Validation: Long LP must be < entry, Short LP must be > entry
-  if (direction > 0 && lp >= entryPrice) return 0;
-  if (direction < 0 && lp <= entryPrice) return 0;
-  if (lp <= 0) return 0;
-
-  return lp;
+  const lp = (entryPrice - (isoBalance + ma) / size) / (1 - direction * mmr);
+  return Number.isFinite(lp) && lp > 0 ? lp : 0;
 }
 
 /**
@@ -61,16 +56,14 @@ export function calculateIsolatedLiquidationPrice(
  *   LP = (EP - (W + TU - TM + MA) / Size) / (1 - Direction * MMR)
  *
  * Where:
- *   W  = WalletBalance - sum(all isolated IsoBalance)
- *   TU = sum(OTHER cross positions' uPnL)
- *   TM = sum(OTHER cross positions' maintenanceMargin)
+ *   W  = WalletBalance - Σ(all isolated) IsoBalance
+ *   TU = Σ uPnL of OTHER cross positions   (0 when this is the only cross position)
+ *   TM = Σ MM of OTHER cross positions     (0 when this is the only cross position)
  *
  * @example Cross Long 0.5 BTC at $43,000. Wallet=$10,500. Other cross ETH uPnL=+$100, mm=$30.
  *   One isolated position isoBalance=$500. mmr=0.004, ma=$0.
- *
- *   W = $10,500 - $500 = $10,000
- *   numerator = 43000 - (10000 + 100 - 30 + 0) / 0.5 = 43000 - 20140 = 22860
- *   denominator = 1 - 1 * 0.004 = 0.996
+ *   W = $10,000
+ *   numerator = 43000 - (10000 + 100 - 30 + 0) / 0.5 = 22860
  *   LP = 22860 / 0.996 = $22,951.81
  */
 export function calculateCrossLiquidationPrice(
@@ -81,26 +74,29 @@ export function calculateCrossLiquidationPrice(
   ma: number = 0
 ): number {
   if (size === 0) return 0;
-
-  const {
-    walletBalance,
-    totalIsolatedMargin,
-    otherCrossUPnL,
-    otherCrossMaintenanceMargin,
-  } = context;
+  const { walletBalance, totalIsolatedMargin, otherCrossUPnL, otherCrossMaintenanceMargin } = context;
 
   const W = walletBalance - totalIsolatedMargin;
   const direction = size > 0 ? 1 : -1;
-  const numerator =
-    entryPrice - (W + otherCrossUPnL - otherCrossMaintenanceMargin + ma) / size;
-  const denominator = 1 - direction * mmr;
+  const lp =
+    (entryPrice - (W + otherCrossUPnL - otherCrossMaintenanceMargin + ma) / size) /
+    (1 - direction * mmr);
+  return Number.isFinite(lp) && lp > 0 ? lp : 0;
+}
 
-  if (denominator === 0) return 0;
-
-  const lp = numerator / denominator;
-  if (lp <= 0) return 0;
-
-  return lp;
+/**
+ * Bankruptcy price (margin balance reaches zero): BP = EP - (W + TU) / Size.
+ * Same W/TU as the liquidation price; 0 when <= 0.
+ */
+export function calculateBankruptcyPrice(
+  entryPrice: number,
+  size: number,
+  w: number,
+  otherUPnL: number = 0
+): number {
+  if (size === 0) return 0;
+  const bp = entryPrice - (w + otherUPnL) / size;
+  return Number.isFinite(bp) && bp > 0 ? bp : 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════
@@ -108,16 +104,26 @@ export function calculateCrossLiquidationPrice(
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * Calculate all derived fields for a position given the current mark price.
- * Call this on every markPriceUpdate for each position.
+ * Derived fields for a position at the current mark price (backend
+ * Position.UpdateDerived, rounded half-even to quote_prec):
  *
- * @example Long 0.5 BTC, entry=$43,000, mark=$43,500, isolated, isoBalance=$1,075:
+ *   uPnL     = (mark - entry) × signedSize
+ *   notional = mark × |size|               (tier lookup uses the unrounded notional)
+ *   IM       = notional / leverage         (position leverage)
+ *   MM       = notional × MMR - MA
+ *
+ * UI-only fields (the backend does not serve them for open positions):
+ *   currentMargin  isolated: iso_balance; cross: IM
+ *   pnlPercentage  uPnL / (entry × |size| / leverage) × 100 — same margin base
+ *                  as the backend's roi_pct on closing fills
+ *   marginRatio    isolated: MM / (iso_balance + uPnL) × 100 (cross is set by
+ *                  applyCrossLiquidationPrices from the shared cross profile)
+ *
+ * @example Long 0.5 BTC, entry=$43,000, mark=$43,500, isolated, isoBalance=$1,075, 20x:
  *   uPnL = (43500 - 43000) * 0.5 = +$250.00
  *   notional = 43500 * 0.5 = $21,750
- *   currentMargin = $1,075 (isoBalance)
- *   maintenanceMargin = 21750 * 0.004 - 0 = $87.00
- *   leverage = 21750 / 1075 = 20.23x
- *   pnlPercentage = (250 / 1075) * 100 = +23.26%
+ *   MM = 21750 * 0.004 - 0 = $87.00
+ *   pnlPercentage = 250 / (43000 * 0.5 / 20) * 100 = +23.26%
  */
 export function calculatePositionDerived(
   position: Position,
@@ -128,75 +134,42 @@ export function calculatePositionDerived(
     return {};
   }
 
-  const { entryPrice, size, positionSide, marginMode, isoBalance } = position;
+  const prec = quotePrec(market);
+  const { entryPrice, size, positionSide, marginMode, isoBalance, leverage } = position;
+  const signedSize = positionSide === "LONG" ? size : -size;
 
-  // Unrealized PnL
-  const priceDiff = markPrice - entryPrice;
-  const uPnL = positionSide === "LONG" ? priceDiff * size : -priceDiff * size;
+  // The engine rounds the incoming mark to quote_prec before any risk math
+  const mark = roundHalfEven(markPrice, prec);
+  const rawNotional = mark * size; // tier lookup uses the unrounded notional
+  const mmr = getMMR(market, rawNotional);
+  const ma = getMaintenanceAmount(market, rawNotional);
 
-  // Notional
-  const notional = markPrice * Math.abs(size);
+  const uPnL = roundHalfEven((mark - entryPrice) * signedSize, prec);
+  const notional = roundHalfEven(rawNotional, prec);
+  const initialMargin = leverage > 0 ? roundHalfEven(rawNotional / leverage, prec) : 0;
+  const maintenanceMargin = roundHalfEven(rawNotional * mmr - ma, prec);
 
-  // Maintenance margin
-  const mmr = getMMR(market, notional);
-  const maintAmount = getMaintenanceAmount(market, notional);
-  const maintenanceMargin =
-    notional > 0 ? notional * mmr - maintAmount : 0;
+  const isIsolated = marginMode === "isolated";
+  const currentMargin = isIsolated ? isoBalance : initialMargin;
 
-  // Current margin
-  let currentMargin: number;
-  let requiredMargin: number | undefined;
+  const entryMargin = leverage > 0 ? (entryPrice * size) / leverage : 0;
+  const pnlPercentage = entryMargin > 0 ? (uPnL / entryMargin) * 100 : 0;
 
-  if (marginMode === "isolated") {
-    currentMargin = isoBalance;
-    const posLeverage = position.leverage ?? 1;
-    requiredMargin = posLeverage > 0 ? notional / posLeverage : 0;
-  } else {
-    const lev = position.leverage || 1;
-    currentMargin = lev > 0 ? notional / lev : 0;
-  }
-
-  // Leverage (actual)
-  let leverage: number;
-  if (marginMode === "isolated" && isoBalance > 0) {
-    leverage = notional / isoBalance;
-  } else {
-    leverage = position.leverage ?? 0;
-    if (leverage === 0 && currentMargin > 0) {
-      leverage = notional / currentMargin;
-    }
-  }
-
-  // PnL percentage (ROE)
-  const pnlPercentage =
-    currentMargin > 0 ? (uPnL / currentMargin) * 100 : 0;
-
-  // Margin ratio (only when losing)
-  const marginRatio =
-    uPnL < 0 && currentMargin > 0
-      ? (Math.abs(uPnL) / currentMargin) * 100
-      : 0;
-
-  // Liquidation price (isolated only here — cross needs full context)
-  let liquidationPrice = 0;
-  if (marginMode === "isolated") {
-    const signedSize = positionSide === "LONG" ? size : -size;
-    liquidationPrice = calculateIsolatedLiquidationPrice(
-      entryPrice,
-      signedSize,
-      isoBalance,
-      mmr,
-      maintAmount
-    );
+  let marginRatio: number | undefined;
+  let liquidationPrice: number | undefined;
+  if (isIsolated) {
+    const marginBalance = isoBalance + uPnL;
+    marginRatio = marginBalance > 0 ? (maintenanceMargin / marginBalance) * 100 : Infinity;
+    liquidationPrice = calculateIsolatedLiquidationPrice(entryPrice, signedSize, isoBalance, mmr, ma);
   }
 
   return {
+    markPrice: mark,
     uPnL,
     notional,
     currentMargin,
-    requiredMargin,
+    requiredMargin: isIsolated ? initialMargin : undefined,
     maintenanceMargin,
-    leverage,
     pnlPercentage,
     marginRatio,
     liquidationPrice,
@@ -205,7 +178,6 @@ export function calculatePositionDerived(
 
 /**
  * Enrich a position with all derived fields.
- * Returns a new position object with derived fields merged in.
  */
 export function enrichPositionWithDerived(
   position: Position,
@@ -219,17 +191,77 @@ export function enrichPositionWithDerived(
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// CROSS PROFILE (MULTI-POSITION)
+// ═══════════════════════════════════════════════════════════════════
+
+/**
+ * Cross liquidation price and cross margin ratio for every cross position.
+ * Must be called AFTER enrichPositionWithDerived for each position.
+ *
+ * Cross profile: W = wallet - Σ iso_balance, UPnL = Σ cross uPnL, MM = Σ cross MM.
+ * Margin ratio = MM / (W + UPnL) (liquidation at >= 100%, reduce-only at >= 90%).
+ *
+ * @example
+ *   const enriched = positions.map(p => enrichPositionWithDerived(p, markPrices[p.symbol], markets[p.symbol]));
+ *   const final = applyCrossLiquidationPrices(enriched, walletBalance, markets);
+ */
+export function applyCrossLiquidationPrices(
+  positions: Position[],
+  walletBalance: number,
+  markets: Record<string, Market>
+): Position[] {
+  let totalIsolatedMargin = 0;
+  let totalCrossUPnL = 0;
+  let totalCrossMaintenanceMargin = 0;
+
+  for (const p of positions) {
+    if (p.marginMode === "isolated") {
+      totalIsolatedMargin += p.isoBalance ?? 0;
+    } else {
+      totalCrossUPnL += p.uPnL ?? 0;
+      totalCrossMaintenanceMargin += p.maintenanceMargin ?? 0;
+    }
+  }
+
+  const crossMarginBalance = walletBalance - totalIsolatedMargin + totalCrossUPnL;
+  const crossMarginRatio =
+    crossMarginBalance > 0 ? (totalCrossMaintenanceMargin / crossMarginBalance) * 100 : Infinity;
+
+  return positions.map((p) => {
+    if (p.marginMode !== "cross" || !p.notional) return p;
+
+    const market = markets[p.symbol];
+    const rawNotional = p.markPrice ? p.markPrice * p.size : p.notional; // unrounded for the tier
+    const mmr = getMMR(market, rawNotional);
+    const ma = getMaintenanceAmount(market, rawNotional);
+    const signedSize = p.positionSide === "LONG" ? p.size : -p.size;
+
+    const context: CrossLiquidationContext = {
+      walletBalance,
+      totalIsolatedMargin,
+      otherCrossUPnL: totalCrossUPnL - (p.uPnL ?? 0),
+      otherCrossMaintenanceMargin: totalCrossMaintenanceMargin - (p.maintenanceMargin ?? 0),
+    };
+
+    const liquidationPrice = calculateCrossLiquidationPrice(p.entryPrice, signedSize, mmr, context, ma);
+    return { ...p, liquidationPrice, marginRatio: crossMarginRatio };
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // PRE-TRADE LIQUIDATION ESTIMATION
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * Estimate liquidation price for an order BEFORE placing it.
- * Used for the immediate-liquidation safety check in the order form.
+ * Estimate the liquidation price of a NEW position opened by an order, for the
+ * immediate-liquidation check in the order form. (It ignores an existing
+ * position in the same symbol, which the fill would merge into.)
  *
- * For ISOLATED: builds context with just the order's own margin (notional/leverage).
- * For CROSS: aggregates all existing positions to build cross context.
+ * ISOLATED: the engine reserves, per opening fill,
+ *   iso = size × fillPrice / leverage + OpenLoss, then enforces iso >= max(IM, MM) at mark.
+ * CROSS: uses the cross profile of all other existing positions.
  *
- * Returns null if inputs are insufficient, 0 if liq price is invalid.
+ * Returns null if inputs are insufficient, 0 if there is no liquidation price.
  */
 export function estimateOrderLiquidationPrice(params: {
   size: number;
@@ -241,103 +273,48 @@ export function estimateOrderLiquidationPrice(params: {
   marginMode: "Cross" | "Isolated";
   walletBalance: number;
   positions: Position[];
+  symbol: string;
 }): number | null {
   const {
     size, entryPrice, leverage, side, markPrice, market,
-    marginMode, walletBalance, positions,
+    marginMode, walletBalance, positions, symbol,
   } = params;
 
   if (!size || !entryPrice || !leverage || !market) return null;
 
   const signedSize = side === "Long" ? size : -size;
-  const notional = size * entryPrice;
-  const mmr = getMMR(market, notional);
-  const ma = getMaintenanceAmount(market, notional);
+  const refPrice = markPrice > 0 ? markPrice : entryPrice;
+  const notionalAtMark = size * refPrice;
+  const mmr = getMMR(market, notionalAtMark);
+  const ma = getMaintenanceAmount(market, notionalAtMark);
 
   if (marginMode === "Isolated") {
-    const isoBalance = notional / leverage;
+    const openLoss =
+      markPrice > 0 ? size * Math.max(0, side === "Long" ? entryPrice - markPrice : markPrice - entryPrice) : 0;
+    const reserve = (size * entryPrice) / leverage + openLoss;
+    const im = notionalAtMark / leverage;
+    const mm = notionalAtMark * mmr - ma;
+    const isoBalance = Math.max(reserve, im, mm, 0);
     return calculateIsolatedLiquidationPrice(entryPrice, signedSize, isoBalance, mmr, ma);
   }
 
-  // Cross: aggregate existing positions
   let totalIsolatedMargin = 0;
-  let totalCrossUPnL = 0;
-  let totalCrossMaintenanceMargin = 0;
-
+  let otherCrossUPnL = 0;
+  let otherCrossMaintenanceMargin = 0;
   for (const p of positions) {
     if (p.marginMode === "isolated") {
       totalIsolatedMargin += p.isoBalance ?? 0;
-    } else {
-      totalCrossUPnL += p.uPnL ?? 0;
-      totalCrossMaintenanceMargin += p.maintenanceMargin ?? 0;
+    } else if (p.symbol !== symbol) {
+      otherCrossUPnL += p.uPnL ?? 0;
+      otherCrossMaintenanceMargin += p.maintenanceMargin ?? 0;
     }
   }
 
-  const context: CrossLiquidationContext = {
-    walletBalance,
-    totalIsolatedMargin,
-    otherCrossUPnL: totalCrossUPnL,
-    otherCrossMaintenanceMargin: totalCrossMaintenanceMargin,
-  };
-
-  return calculateCrossLiquidationPrice(entryPrice, signedSize, mmr, context, ma);
-}
-
-// ═══════════════════════════════════════════════════════════════════
-// CROSS LIQUIDATION (MULTI-POSITION)
-// ═══════════════════════════════════════════════════════════════════
-
-/**
- * For an array of positions, calculate cross liquidation prices.
- * Must be called AFTER enrichPositionWithDerived for each position.
- *
- * @example
- *   const enriched = positions.map(p => enrichPositionWithDerived(p, markPrices[p.symbol], markets[p.symbol]));
- *   const final = applyCrossLiquidationPrices(enriched, walletBalance, markets);
- */
-export function applyCrossLiquidationPrices(
-  positions: Position[],
-  walletBalance: number,
-  markets: Record<string, Market>
-): Position[] {
-  // Aggregate totals
-  let totalIsolatedMargin = 0;
-  let totalCrossUPnL = 0;
-  let totalCrossMaintenanceMargin = 0;
-
-  for (const p of positions) {
-    if (p.marginMode === "isolated") {
-      totalIsolatedMargin += p.isoBalance ?? 0;
-    } else {
-      totalCrossUPnL += p.uPnL ?? 0;
-      totalCrossMaintenanceMargin += p.maintenanceMargin ?? 0;
-    }
-  }
-
-  return positions.map((p) => {
-    if (p.marginMode !== "cross" || !p.notional) return p;
-
-    const market = markets[p.symbol];
-    const mmr = getMMR(market, p.notional);
-    const ma = getMaintenanceAmount(market, p.notional);
-    const signedSize = p.positionSide === "LONG" ? p.size : -p.size;
-
-    const context: CrossLiquidationContext = {
-      walletBalance,
-      totalIsolatedMargin,
-      otherCrossUPnL: totalCrossUPnL - (p.uPnL ?? 0),
-      otherCrossMaintenanceMargin:
-        totalCrossMaintenanceMargin - (p.maintenanceMargin ?? 0),
-    };
-
-    const liquidationPrice = calculateCrossLiquidationPrice(
-      p.entryPrice,
-      signedSize,
-      mmr,
-      context,
-      ma
-    );
-
-    return { ...p, liquidationPrice };
-  });
+  return calculateCrossLiquidationPrice(
+    entryPrice,
+    signedSize,
+    mmr,
+    { walletBalance, totalIsolatedMargin, otherCrossUPnL, otherCrossMaintenanceMargin },
+    ma
+  );
 }

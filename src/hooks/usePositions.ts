@@ -2,7 +2,7 @@ import { useMemo } from "react";
 import type { Position } from "../types/position";
 import type { Market } from "../types/market";
 import type { MarkPriceUpdate } from "../types/ws";
-import type { Account } from "../types/account";
+import type { SymbolsResponse } from "../types/account";
 import {
   enrichPositionWithDerived,
   applyCrossLiquidationPrices,
@@ -12,44 +12,36 @@ import {
  * Enrich positions with all derived fields using live mark prices.
  * Recalculates on every mark price change.
  *
- * Leverage fallback (matches Strike app UserStreamContext lines 193-196):
- *   position.leverage ?? account.symbol_settings[symbol].leverage ?? market.default_leverage
- *
- * This is critical because WS ACCOUNT_UPDATE doesn't send leverage,
- * so new positions from WS would have leverage=0 without this fallback.
+ * Leverage: REST /v2/positions and WS ACCOUNT_UPDATE both carry the position's
+ * leverage; if missing, fall back to the effective symbol leverage from
+ * GET /v2/symbols, then the market default.
  */
 export function useEnrichedPositions(
   positions: Position[],
   prices: Record<string, MarkPriceUpdate>,
   markets: Record<string, Market>,
   walletBalance: number,
-  account?: Account | null
+  symbols?: SymbolsResponse | null
 ): Position[] {
   return useMemo(() => {
-    // Step 1: Basic enrichment with leverage fallback
     const basicEnriched = positions.map((position) => {
       const symbol = position.symbol;
       const markPriceData = prices[symbol];
-      const markPrice = markPriceData
-        ? parseFloat(markPriceData.p || markPriceData.i || "0")
-        : 0;
       const market = markets[symbol];
+      const markPrice = markPriceData
+        ? parseFloat(markPriceData.p)
+        : parseFloat(market?.mark_price ?? "0");
 
-      // Leverage fallback: position → account symbol_settings → market default
       const leverage =
         position.leverage ||
-        account?.symbol_settings?.[symbol]?.leverage ||
+        symbols?.symbol_settings?.[symbol]?.leverage ||
         market?.default_leverage ||
         1;
 
-      return enrichPositionWithDerived(
-        { ...position, leverage },
-        markPrice,
-        market
-      );
+      return enrichPositionWithDerived({ ...position, leverage }, markPrice, market);
     });
 
-    // Step 2: Apply cross liquidation prices (needs all positions' context)
+    // Cross liquidation prices + cross margin ratio need the whole cross profile
     return applyCrossLiquidationPrices(basicEnriched, walletBalance, markets);
-  }, [positions, prices, markets, walletBalance, account]);
+  }, [positions, prices, markets, walletBalance, symbols]);
 }

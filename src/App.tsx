@@ -6,7 +6,9 @@ import { usePriceStream } from "./hooks/usePriceStream";
 import { useUserStream } from "./hooks/useUserStream";
 import { useEnrichedPositions } from "./hooks/usePositions";
 import { calculateBalances, calculateOpenOrderCosts } from "./math/balanceCalculations";
-import type { SupportedChain } from "./api/wallets";
+import { DEFAULT_FEE_RATES, effectiveFeeRates, tierZeroFeeRates, type FeeRates } from "./math/fees";
+import { getFeeTiers, getPortfolio } from "./api/account";
+import { BUILDER_FEE_BPS } from "./api/config";
 import type { ConnectedInfo } from "./components/ConnectPanel";
 
 import { ConnectPanel } from "./components/ConnectPanel";
@@ -24,9 +26,11 @@ export default function App() {
   // All auth state in memory — no localStorage
   const [connectedInfo, setConnectedInfo] = useState<ConnectedInfo | null>(null);
   const accountId = connectedInfo?.accountId ?? null;
-  const chain = connectedInfo?.chain ?? "cardano";
 
-  // Listen for session expired (401 from API wallet auth)
+  // Per-order builder fee: configured value, capped by the user's approved fee_share_bps
+  const builderFeeBps = Math.min(BUILDER_FEE_BPS, connectedInfo?.feeShareBps ?? 0);
+
+  // Listen for session expired (API wallet rejected by the server)
   useEffect(() => {
     const handler = () => {
       console.log("[App] Session expired — resetting to connect screen");
@@ -38,47 +42,70 @@ export default function App() {
 
   // Market data
   const { markets, symbols } = useMarkets();
-  const [symbol, setSymbol] = useState("ADA-USD");
+  const [symbol, setSymbol] = useState("BTC-USD");
+  useEffect(() => {
+    if (symbols.length > 0 && !symbols.includes(symbol)) setSymbol(symbols[0]);
+  }, [symbols, symbol]);
 
   // Real-time price stream
   const { prices, markPrice, indexPrice, fundingRate, nextFundingTime, depth } =
     usePriceStream(symbol);
 
-  // User data stream: REST fetch on connect, then WS updates
-  const { positions, orders, walletBalance, account } = useUserStream(accountId);
+  // User data: REST (re)load after each user-stream subscribe, then WS updates
+  const {
+    positions,
+    orders,
+    walletBalance,
+    account,
+    symbols: symbolSettings,
+    refreshSymbols,
+  } = useUserStream(accountId);
 
-  // Enrich positions with derived fields (PnL, liquidation, etc.)
-  // Pass account for leverage fallback (WS doesn't send leverage)
+  // Fee rates: public tier 0 first, then the account's tier (GET /v2/portfolio:
+  // fee tier, maker override, referral/staking discounts)
+  const [feeRates, setFeeRates] = useState<FeeRates>(DEFAULT_FEE_RATES);
+  useEffect(() => {
+    getFeeTiers()
+      .then((res) => {
+        const t0 = tierZeroFeeRates(res);
+        if (t0) setFeeRates((prev) => (prev === DEFAULT_FEE_RATES ? t0 : prev));
+      })
+      .catch((e) => console.warn("[App] /v2/fee-tiers unavailable:", e));
+  }, []);
+  useEffect(() => {
+    if (!accountId) return;
+    getPortfolio()
+      .then((info) => setFeeRates(effectiveFeeRates(info)))
+      .catch((e) => console.warn("[App] Fee rates unavailable, using tier 0:", e));
+  }, [accountId]);
+
+  // Enrich positions with derived fields (uPnL, IM, MM, liquidation price, ...)
   const enrichedPositions = useEnrichedPositions(
     positions,
     prices,
     markets,
     walletBalance,
-    account
+    symbolSettings
   );
 
-  // Open order costs — margin locked by open orders (matches Strike app netting formula)
-  const openOrderCosts = useMemo(() =>
-    calculateOpenOrderCosts(orders, positions, prices, account?.symbol_settings, markets),
-    [orders, positions, prices, account?.symbol_settings, markets]
+  // Effective symbol leverage (GET /v2/symbols) for open-order margin
+  const leverageBySymbol = useMemo(() => {
+    const out: Record<string, number> = {};
+    for (const [sym, s] of Object.entries(symbolSettings?.symbol_settings ?? {})) out[sym] = s.leverage;
+    return out;
+  }, [symbolSettings]);
+
+  // Open order costs — margin locked by open orders (TotalOrderCost netting formula)
+  const openOrderCosts = useMemo(
+    () => calculateOpenOrderCosts(orders, enrichedPositions, leverageBySymbol, markets),
+    [orders, enrichedPositions, leverageBySymbol, markets]
   );
 
-  // Calculate balances with open order costs factored in
-  const balances = useMemo(() => {
-    const calculated = calculateBalances(walletBalance, enrichedPositions, openOrderCosts);
-    if (account) {
-      const serverAvailable = parseFloat(account.available_balance || "0");
-      const serverWithdrawable = parseFloat(account.withdrawable_balance || "0");
-      const serverMarginBalance = parseFloat(account.margin_balance || "0");
-      return {
-        ...calculated,
-        availableBalance: serverAvailable || calculated.availableBalance,
-        withdrawableBalance: serverWithdrawable || calculated.withdrawableBalance,
-        marginBalance: serverMarginBalance || calculated.marginBalance,
-      };
-    }
-    return calculated;
-  }, [walletBalance, enrichedPositions, openOrderCosts, account]);
+  // Live balances, same formulas as GET /v2/account (which is a point-in-time snapshot)
+  const balances = useMemo(
+    () => calculateBalances(walletBalance, enrichedPositions, openOrderCosts),
+    [walletBalance, enrichedPositions, openOrderCosts]
+  );
 
   const currentMarket = markets[symbol] ?? null;
   const basePrec = currentMarket?.base_prec ?? 4;
@@ -94,7 +121,7 @@ export default function App() {
       <header className="app-header">
         <h1>Strike Builder Reference</h1>
         <MarketSelector
-          symbols={symbols.length > 0 ? symbols : ["ADA-USD"]}
+          symbols={symbols.length > 0 ? symbols : [symbol]}
           selected={symbol}
           onChange={setSymbol}
         />
@@ -108,18 +135,18 @@ export default function App() {
             onDisconnected={() => setConnectedInfo(null)}
           />
 
-          {accountId && (
+          {connectedInfo && (
             <>
               <AccountPanel
                 walletBalance={walletBalance}
                 availableBalance={balances.availableBalance}
                 marginBalance={balances.marginBalance}
-                positionValue={balances.positionValue}
+                totalInitialMargin={balances.totalInitialMargin}
                 totalUnrealizedPnL={balances.totalUnrealizedPnL}
               />
-              <DepositPanel accountId={accountId} chain={chain} />
+              <DepositPanel wallet={connectedInfo.wallet} />
               <WithdrawPanel
-                chain={chain}
+                wallet={connectedInfo.wallet}
                 withdrawableBalance={balances.withdrawableBalance}
               />
             </>
@@ -154,6 +181,10 @@ export default function App() {
                 availableBalance={balances.availableBalance}
                 accountId={accountId}
                 account={account}
+                symbolSetting={symbolSettings?.symbol_settings?.[symbol]}
+                onSettingsChanged={refreshSymbols}
+                feeRates={feeRates}
+                builderFeeBps={builderFeeBps}
               />
             )}
           </div>
@@ -163,6 +194,8 @@ export default function App() {
             basePrec={basePrec}
             markets={markets}
             prices={prices}
+            feeRates={feeRates}
+            builderFeeBps={builderFeeBps}
           />
         </main>
       </div>

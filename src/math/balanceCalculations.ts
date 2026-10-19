@@ -1,99 +1,75 @@
 import type { Position } from "../types/position";
 import type { Market } from "../types/market";
-import type { MarkPriceUpdate } from "../types/ws";
-import { getMaxLeverage } from "./marginTiers";
+import type { OrderRow } from "../types/order";
+import { roundHalfEven } from "./formatUtils";
+
+// Mirrors pkg/models/balance.go, pkg/models/margin.go (TotalOrderCost) and the
+// API balance snapshot (services/api/controller/api.go loadAccountBalanceSnapshot).
 
 // ═══════════════════════════════════════════════════════════════════
-// OPEN ORDER COSTS (matches Strike app UserStreamContext lines 1019-1100)
+// OPEN ORDER COSTS (Total Order Cost, per symbol)
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * Calculate margin locked by open orders using the netting formula.
+ * Margin locked by open orders, summed over symbols.
  *
- * Per symbol: aggregate bid/ask notional from open limit/market orders,
- * then net against existing position direction:
- *   - No position: max(bidNotional, askNotional)
- *   - LONG: buys add exposure, sells reduce (up to 2x position notional)
- *   - SHORT: sells add exposure, buys reduce (up to 2x position notional)
- *   - Cost = nettedNotional / leverage
+ * Per symbol, over pending/open LIMIT and MARKET orders only (untriggered
+ * conditional orders are excluded until they trigger):
+ *   bid = Σ price × remaining (buys), ask = Σ price × remaining (sells)
+ *   f   = max(bid, ask − 2×notional)  if the position is long or flat
+ *   f   = max(ask, bid − 2×notional)  if the position is short
+ *   TotalOrderCost = round(f / symbolLeverage, quote_prec) [+ opening fee reserve]
+ *
+ * Not included here: the opening-fee reserve that the engine adds for ordinary
+ * (non-reduce-only) orders on ISOLATED symbols
+ * (remaining × execPrice × (2×max(maker, taker) + builderBps/10000)).
+ *
+ * @param leverageBySymbol - effective symbol leverage (GET /v2/symbols)
  */
 export function calculateOpenOrderCosts(
-  orders: any[],
+  orders: OrderRow[],
   positions: Position[],
-  prices: Record<string, MarkPriceUpdate>,
-  symbolSettings: Record<string, { leverage: number }> | null | undefined,
+  leverageBySymbol: Record<string, number>,
   markets: Record<string, Market>
 ): number {
   if (!orders.length) return 0;
 
-  // Step 1: Build bid/ask notional aggregates per symbol
   const symbolAgg: Record<string, { bidNotional: number; askNotional: number }> = {};
 
   for (const order of orders) {
-    // Only include Limit or Market orders that are Pending or Open
-    const type = String(order.Type ?? order.type ?? "").toUpperCase();
-    const status = String(order.Status ?? order.status ?? "").toUpperCase();
-    if (
-      (type !== "LIMIT" && type !== "MARKET") ||
-      (status !== "PENDING" && status !== "OPEN" && status !== "NEW" && status !== "PARTIALLY_FILLED")
-    ) continue;
+    const type = order.Type.toUpperCase();
+    const status = order.Status.toUpperCase();
+    // REST: "pending"/"open"; WS: "NEW"/"OPEN" (NEW also covers untriggered, excluded by type)
+    if (type !== "LIMIT" && type !== "MARKET") continue;
+    if (status !== "PENDING" && status !== "OPEN" && status !== "NEW") continue;
 
-    const sym = order.Symbol ?? order.symbol ?? "";
-    const side = String(order.Side ?? order.side ?? "").toUpperCase();
-    const remaining = Math.max(0, parseFloat(order.Size ?? order.size ?? "0") - parseFloat(order.Filled ?? order.filled ?? "0"));
-    const price = parseFloat(order.Price ?? order.price ?? "0");
+    const remaining = Math.max(0, parseFloat(order.Size || "0") - parseFloat(order.Filled || "0"));
+    const price = parseFloat(order.Price || "0");
     if (remaining <= 0 || price <= 0) continue;
 
     const notional = remaining * price;
-    if (!symbolAgg[sym]) symbolAgg[sym] = { bidNotional: 0, askNotional: 0 };
-
-    if (side === "BUY") {
-      symbolAgg[sym].bidNotional += notional;
-    } else {
-      symbolAgg[sym].askNotional += notional;
-    }
+    const agg = (symbolAgg[order.Symbol] ??= { bidNotional: 0, askNotional: 0 });
+    if (order.Side.toUpperCase() === "BUY") agg.bidNotional += notional;
+    else agg.askNotional += notional;
   }
 
-  // Step 2-4: Apply netting formula per symbol and sum
   let total = 0;
-  for (const sym of Object.keys(symbolAgg)) {
-    const { bidNotional, askNotional } = symbolAgg[sym];
-    if (bidNotional === 0 && askNotional === 0) continue;
-
+  for (const [sym, { bidNotional, askNotional }] of Object.entries(symbolAgg)) {
     const position = positions.find((p) => p.symbol === sym);
-    const positionSize = position ? position.size : 0;
-    const direction = position
-      ? (position.positionSide === "LONG" ? 1 : position.positionSide === "SHORT" ? -1 : 0)
-      : 0;
+    const direction = position ? (position.positionSide === "LONG" ? 1 : -1) : 0;
+    const notionalTwice = 2 * (position?.notional ?? 0);
 
-    const markPriceData = prices[sym];
-    const mp = markPriceData ? parseFloat(markPriceData.p || markPriceData.i || "0") : 0;
-    const posNotional = mp * Math.abs(positionSize);
-    const notionalTwice = posNotional * 2;
-
-    // Netting formula (matches Strike app exactly)
     let f: number;
-    if (direction === 0) {
-      f = Math.max(bidNotional, askNotional);
-    } else if (direction > 0) {
-      // LONG position
-      f = askNotional <= notionalTwice
-        ? bidNotional
-        : Math.max(bidNotional, askNotional - notionalTwice);
+    if (direction >= 0 && position) {
+      f = askNotional <= notionalTwice ? bidNotional : Math.max(bidNotional, askNotional - notionalTwice);
+    } else if (direction < 0) {
+      f = bidNotional <= notionalTwice ? askNotional : Math.max(askNotional, bidNotional - notionalTwice);
     } else {
-      // SHORT position
-      f = bidNotional <= notionalTwice
-        ? askNotional
-        : Math.max(askNotional, bidNotional - notionalTwice);
+      f = Math.max(bidNotional, askNotional);
     }
 
-    const leverage =
-      symbolSettings?.[sym]?.leverage ||
-      markets[sym]?.default_leverage ||
-      getMaxLeverage(markets[sym]) ||
-      10;
-
-    total += f / leverage;
+    const leverage = leverageBySymbol[sym] || markets[sym]?.default_leverage || 1;
+    total += roundHalfEven(f / leverage, markets[sym]?.quote_prec ?? 8);
   }
 
   return total;
@@ -104,17 +80,24 @@ export function calculateOpenOrderCosts(
 // ═══════════════════════════════════════════════════════════════════
 
 /**
- * Calculate real-time account balance metrics from positions and wallet balance.
+ * Account balance metrics (CALCULATION_SPECS.md, pkg/models/balance.go):
+ *
+ *   BaseBalance    = wallet − Σ TotalOrderCost − Σ(isolated) iso_balance
+ *   Available      = BaseBalance − Σ(cross) IM + Σ(cross) uPnL          (not clamped)
+ *   Withdrawable   = max(0, BaseBalance − max(Σ(cross) IM − Σ(cross) uPnL, Σ(cross) MM))
+ *                    then min(…, wallet − lockedRewards) when lockedRewards > 0
+ *   MarginBalance  = wallet − Σ(isolated) iso_balance + Σ(cross) uPnL   (cross margin balance)
+ *
+ * REST GET /v2/account additionally subtracts copy-trading holds from
+ * available_balance (and the withdraw quote from the withdraw cap).
  *
  * @example
- *   walletBalance = $10,500
- *   positions: 1 isolated (isoBalance=$1,075), 1 cross (IM=$1,000, uPnL=$200, MM=$45)
- *   openOrderCosts = $500, lockedRewards = $100
- *
- *   marginBalance = $10,500 + $200 = $10,700
- *   crossRequirement = max($1,000 - $200, $45) = $800
- *   availableBalance = max(0, $10,500 - $500 - $1,075 - $800) = $8,125
- *   withdrawable = max(0, ($10,500 - $500 - $1,075) - $800 - $100) = $8,025
+ *   wallet = $10,500; isolated iso = $1,075; cross IM = $1,000, uPnL = +$200, MM = $45
+ *   openOrderCosts = $500
+ *   base = 10,500 − 500 − 1,075 = $8,925
+ *   available = 8,925 − 1,000 + 200 = $8,125
+ *   withdrawable = max(0, 8,925 − max(800, 45)) = $8,125
+ *   marginBalance = 10,500 − 1,075 + 200 = $9,625
  */
 export function calculateBalances(
   walletBalance: number,
@@ -127,46 +110,42 @@ export function calculateBalances(
   let crossUPnL = 0;
   let crossMaintenanceMargin = 0;
   let totalUnrealizedPnL = 0;
+  let totalInitialMargin = 0;
+  let totalMaintenanceMargin = 0;
 
   for (const p of positions) {
+    const im = p.marginMode === "isolated" ? p.requiredMargin ?? 0 : p.currentMargin ?? 0;
     totalUnrealizedPnL += p.uPnL ?? 0;
+    totalInitialMargin += im;
+    totalMaintenanceMargin += p.maintenanceMargin ?? 0;
     if (p.marginMode === "isolated") {
       totalIsolatedMargin += p.isoBalance ?? 0;
     } else {
-      crossInitialMargin += p.currentMargin ?? 0;
+      crossInitialMargin += im;
       crossUPnL += p.uPnL ?? 0;
       crossMaintenanceMargin += p.maintenanceMargin ?? 0;
     }
   }
 
-  const marginBalance = walletBalance + totalUnrealizedPnL;
-
-  const crossRequirement = Math.max(
-    crossInitialMargin - crossUPnL,
-    crossMaintenanceMargin
-  );
-
-  const availableBalance = Math.max(
-    0,
-    walletBalance - openOrderCosts - totalIsolatedMargin - crossRequirement
-  );
-
   const baseBalance = walletBalance - openOrderCosts - totalIsolatedMargin;
-  const withdrawableBalance = Math.max(
-    0,
-    baseBalance - crossRequirement - lockedRewards
-  );
+  const availableBalance = baseBalance - crossInitialMargin + crossUPnL;
 
-  const positionValue = positions.reduce(
-    (sum, p) => sum + (p.currentMargin ?? 0) + (p.uPnL ?? 0),
-    0
+  let withdrawableBalance = Math.max(
+    0,
+    baseBalance - Math.max(crossInitialMargin - crossUPnL, crossMaintenanceMargin)
   );
+  if (lockedRewards > 0) {
+    withdrawableBalance = Math.max(0, Math.min(withdrawableBalance, walletBalance - lockedRewards));
+  }
+
+  const marginBalance = walletBalance - totalIsolatedMargin + crossUPnL;
 
   return {
-    marginBalance,
-    availableBalance,
+    marginBalance, // = /v2/account margin_balance
+    availableBalance, // = /v2/account available_balance (before copy holds)
     withdrawableBalance,
-    positionValue,
-    totalUnrealizedPnL,
+    totalUnrealizedPnL, // = /v2/account unrealized_pnl
+    totalInitialMargin, // = /v2/account position_initial_margin
+    totalMaintenanceMargin, // = /v2/account maintenance_margin
   };
 }

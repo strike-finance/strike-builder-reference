@@ -1,9 +1,9 @@
 import { useState } from "react";
 import { getDepositQuote, buildDepositTx, confirmDeposit } from "../api/deposit";
+import { getCardanoUtxos, type ConnectedWallet } from "../api/wallets";
 
 interface Props {
-  accountId: string;
-  chain: "ethereum" | "solana" | "cardano";
+  wallet: ConnectedWallet;
 }
 
 /**
@@ -11,15 +11,19 @@ interface Props {
  *
  * 1. Enter amount -> POST /v2/deposit/quote
  * 2. Build unsigned TX -> POST /v2/deposit/build-tx
- *    User signs in their wallet (outside this app)
+ *    (user_address = the connected wallet, which is the account's registered
+ *    wallet; Cardano also sends CIP-30 getUtxos()). The user signs and submits
+ *    the tx with their wallet (outside this reference app).
  * 3. Paste tx hash -> POST /v2/deposit (confirm)
  */
-export function DepositPanel({ accountId, chain }: Props) {
-  const [step, setStep] = useState<"amount" | "sign" | "confirm" | "done">("amount");
+export function DepositPanel({ wallet }: Props) {
+  const chain = wallet.chain;
+  const [step, setStep] = useState<"amount" | "sign" | "done">("amount");
   const [amount, setAmount] = useState("");
   const [asset, setAsset] = useState("USDC");
   const [requestId, setRequestId] = useState("");
   const [unsignedTx, setUnsignedTx] = useState("");
+  const [approvalTx, setApprovalTx] = useState("");
   const [txHash, setTxHash] = useState("");
   const [usdValue, setUsdValue] = useState("");
   const [depositAddress, setDepositAddress] = useState("");
@@ -33,21 +37,22 @@ export function DepositPanel({ accountId, chain }: Props) {
       const quote = await getDepositQuote({
         blockchain: chain,
         asset_symbol: asset,
-        asset_amount: amount,
+        asset_amount: amount, // smallest unit, integer string
       });
       setRequestId(quote.request_id);
       setUsdValue(quote.quote.usd_value);
       setDepositAddress(quote.deposit_address);
 
-      // Build unsigned TX
       const tx = await buildDepositTx({
         request_id: quote.request_id,
-        user_address: "", // user fills this or it comes from connect
+        user_address: wallet.address,
+        ...(chain === "cardano" && { utxos: await getCardanoUtxos(wallet.api) }),
       });
       setUnsignedTx(
-        typeof tx.unsigned_tx === "string"
-          ? tx.unsigned_tx
-          : JSON.stringify(tx.unsigned_tx, null, 2)
+        typeof tx.unsigned_tx === "string" ? tx.unsigned_tx : JSON.stringify(tx.unsigned_tx, null, 2)
+      );
+      setApprovalTx(
+        tx.format === "evm_tx_params" && tx.approval_tx ? JSON.stringify(tx.approval_tx, null, 2) : ""
       );
       setStep("sign");
     } catch (e: any) {
@@ -61,7 +66,7 @@ export function DepositPanel({ accountId, chain }: Props) {
     setError("");
     setLoading(true);
     try {
-      await confirmDeposit({ request_id: requestId, tx_hash: txHash });
+      await confirmDeposit({ request_id: requestId, tx_hash: txHash.trim() });
       setStep("done");
     } catch (e: any) {
       setError(e.message);
@@ -77,16 +82,18 @@ export function DepositPanel({ accountId, chain }: Props) {
       {step === "amount" && (
         <>
           <div className="form-group">
-            <label>Asset</label>
+            <label>Asset (must be enabled for {chain})</label>
             <select value={asset} onChange={(e) => setAsset(e.target.value)}>
               <option value="USDC">USDC</option>
+              <option value="USDM">USDM</option>
+              <option value="USDCx">USDCx</option>
               <option value="ADA">ADA</option>
               <option value="SOL">SOL</option>
               <option value="ETH">ETH</option>
             </select>
           </div>
           <div className="form-group">
-            <label>Amount (smallest unit: lamports/lovelace/wei)</label>
+            <label>Amount (smallest unit: lamports/lovelace/wei, USDC = 1e-6)</label>
             <input
               value={amount}
               onChange={(e) => setAmount(e.target.value)}
@@ -102,16 +109,22 @@ export function DepositPanel({ accountId, chain }: Props) {
       {step === "sign" && (
         <>
           <p>USD Value: <strong>${usdValue}</strong></p>
-          <p className="text-secondary text-xs">Deposit to: {depositAddress}</p>
+          <p className="text-secondary text-xs">Strike vault: {depositAddress}</p>
+          {approvalTx && (
+            <div className="form-group">
+              <label>ERC-20 approval (send first):</label>
+              <textarea readOnly value={approvalTx} rows={4} className="code-block" />
+            </div>
+          )}
           <div className="form-group">
-            <label>Unsigned Transaction (sign with your wallet):</label>
+            <label>Unsigned transaction (sign + submit with your wallet):</label>
             <textarea readOnly value={unsignedTx} rows={4} className="code-block" />
           </div>
           <div className="form-group">
-            <label>Paste TX hash after signing & submitting:</label>
+            <label>Paste TX hash after submitting:</label>
             <input value={txHash} onChange={(e) => setTxHash(e.target.value)} placeholder="tx hash" />
           </div>
-          <button onClick={handleConfirm} disabled={!txHash || loading} className="btn btn-primary">
+          <button onClick={handleConfirm} disabled={txHash.trim().length < 10 || loading} className="btn btn-primary">
             {loading ? "Confirming..." : "Confirm Deposit"}
           </button>
         </>

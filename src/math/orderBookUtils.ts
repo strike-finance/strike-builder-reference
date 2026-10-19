@@ -1,4 +1,57 @@
 import type { OrderBookDepthResponse } from "../types/market";
+import type { DepthUpdate } from "../types/ws";
+
+/** Levels carried by the WS depth stream (services/price depth_processor.go maxDepthLevels). */
+export const DEPTH_STREAM_LEVELS = 20;
+
+/**
+ * Apply a WS depthUpdate (top-20 DIFF) to a locally maintained book.
+ *
+ * - Seed the book from GET /price/v2/depth?limit=20 (no snapshot is sent on subscribe).
+ * - Skip events with u <= book.lastUpdateId (already covered by the snapshot);
+ *   U/u are not contiguous across events, so do not require U == last+1.
+ * - qty "0" removes the level (it may only have dropped out of the top 20).
+ * - Diffs are relative to the server's PREVIOUS publish on the channel, not to
+ *   your snapshot; when a symbol gets its first subscriber the server pushes the
+ *   full top 20 with no "0" removals, so stale snapshot levels can survive.
+ *   Re-sync from REST after reconnects, on a crossed book, and periodically.
+ * - b / a may be null when a side did not change.
+ * - The result is re-sorted and truncated to the top 20 per side.
+ *
+ * @returns the new book, or the same object when the event is stale
+ */
+export function applyDepthDiff(
+  book: OrderBookDepthResponse,
+  update: DepthUpdate,
+  maxLevels: number = DEPTH_STREAM_LEVELS
+): OrderBookDepthResponse {
+  if (update.u <= book.lastUpdateId) return book;
+
+  const merge = (levels: string[][], diff: string[][], desc: boolean): string[][] => {
+    const map = new Map<string, string>();
+    for (const [p, q] of levels) map.set(p, q);
+    for (const [p, q] of diff) {
+      // normalize the key so "100.10" and "100.1" match
+      const key = [...map.keys()].find((k) => parseFloat(k) === parseFloat(p)) ?? p;
+      if (parseFloat(q) === 0) map.delete(key);
+      else {
+        map.delete(key);
+        map.set(p, q);
+      }
+    }
+    return [...map.entries()]
+      .sort((a, b) => (desc ? parseFloat(b[0]) - parseFloat(a[0]) : parseFloat(a[0]) - parseFloat(b[0])))
+      .slice(0, maxLevels);
+  };
+
+  return {
+    lastUpdateId: update.u,
+    E: update.E,
+    T: update.E,
+    bids: merge(book.bids, update.b ?? [], true),
+    asks: merge(book.asks, update.a ?? [], false),
+  };
+}
 
 /**
  * Walk the order book to estimate the fill price for a market order (VWAP).
@@ -65,7 +118,7 @@ export function estimateMarketFillPrice(
 
 // ═══════════════════════════════════════════════════════════════════
 // ORDER BOOK AGGREGATION (for rendering)
-// ════════════════���══════════════════════════════════════════════════
+// ═══════════════════════════════════════════════════════════════════
 
 export interface OrderBookEntry {
   price: number;

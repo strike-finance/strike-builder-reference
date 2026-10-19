@@ -2,8 +2,19 @@
  * Wallet extension detection, connection, and signing for all chains.
  *
  * Cardano: CIP-30 wallets (Gero, Eternl, Nami, Vespr, Lace, etc.)
- * Solana:  Phantom, Solflare, Brave
+ * Solana:  Phantom, Solflare
  * EVM:     MetaMask, Rabby, Brave, Phantom, Coinbase
+ *
+ * What the backend verifies (services/api/auth/*.go):
+ *   ethereum: EIP-191 personal_sign over the message text; hex signature
+ *             (0x optional). EOAs and ERC-1271 contract wallets.
+ *   solana:   Ed25519 over the UTF-8 message bytes; base58 address (32 bytes)
+ *             and base58 signature (64 bytes).
+ *   cardano:  CIP-30 signData (COSE_Sign1) sent as "coseSign1Hex:coseKeyHex"
+ *             (or JSON {"signature","key"}). The address MUST be bech32
+ *             (addr1... / addr_test1...). The payload is hex: plain-text
+ *             challenges (builder connect) are hex-encoded by the client,
+ *             while withdraw message_to_sign is already hex for Cardano.
  */
 
 import { API_BASE_URL } from "./config";
@@ -157,14 +168,9 @@ export async function connectCardano(walletId: string): Promise<ConnectedWallet>
   console.log("[Wallet] addressHex:", addressHex);
   console.log("[Wallet] networkId:", networkId);
 
-  let address: string;
-  try {
-    address = decodeCardanoAddress(addressHex, networkId);
-    console.log("[Wallet] Decoded address:", address);
-  } catch (e) {
-    console.warn("[Wallet] bech32 decode failed, using hex as address:", e);
-    address = addressHex;
-  }
+  // The backend decodes Cardano addresses as bech32 only.
+  const address = encodeCardanoAddress(addressHex, networkId);
+  console.log("[Wallet] bech32 address:", address);
 
   // Network check: testnet (preprod) = 0, mainnet = 1
   const isTestnet = API_BASE_URL.includes("testnet");
@@ -182,27 +188,50 @@ export async function connectCardano(walletId: string): Promise<ConnectedWallet>
  * Sign a message with a Cardano CIP-30 wallet (signData).
  * Returns signature in "coseSign1Hex:coseKeyHex" format.
  *
+ * @param message      - text to sign
+ * @param payloadIsHex - true when `message` is ALREADY hex (Cardano withdraw
+ *                       message_to_sign); false for plain text (builder connect),
+ *                       which is hex-encoded here exactly like the backend does.
+ *
  * @example
- *   const sig = await signCardano(api, addressHex, "Connect to Strike...");
+ *   const sig = await signCardano(api, "addr1...", "Connect to Strike...");
  *   // sig = "845846a201....:a401012006..."
  */
 export async function signCardano(
   api: any,
   address: string,
-  message: string
+  message: string,
+  payloadIsHex: boolean = false
 ): Promise<string> {
   if (!api.signData) {
     throw new Error("Wallet does not support CIP-30 signData");
   }
 
-  // Convert address to hex bytes for signData
+  // CIP-30 signData takes the address as hex bytes
   const signAddress = cardanoAddressToHex(address);
-
-  // Convert message to hex payload
-  const payloadHex = stringToHex(message);
+  const payloadHex = payloadIsHex ? message : stringToHex(message);
 
   const { signature, key } = await api.signData(signAddress, payloadHex);
   return `${signature}:${key}`;
+}
+
+/** CIP-30 getUtxos() — hex CBOR UTxOs, required by POST /v2/deposit/build-tx on Cardano. */
+export async function getCardanoUtxos(api: any): Promise<string[]> {
+  const utxos = await api.getUtxos();
+  if (!Array.isArray(utxos) || utxos.length === 0) {
+    throw new Error("Cardano wallet returned no UTxOs");
+  }
+  return utxos;
+}
+
+/**
+ * CIP-30 signTx(txCbor, partialSign=true) — used for the Cardano withdraw
+ * funding tx (quote.tx_cbor). Send the result as signed_tx_cbor to
+ * POST /v2/withdraw; the backend submits it (do not submit it yourself).
+ */
+export async function signCardanoTx(api: any, txCbor: string): Promise<string> {
+  if (!api.signTx) throw new Error("Wallet does not support CIP-30 signTx");
+  return api.signTx(txCbor, true);
 }
 
 // ── Solana Connection ──
@@ -233,7 +262,10 @@ export async function connectSolana(walletId: string): Promise<ConnectedWallet> 
   }
 
   const resp = await provider.connect();
-  const address = resp.publicKey.toString();
+  // Phantom returns { publicKey }; Solflare sets provider.publicKey
+  const publicKey = resp?.publicKey ?? provider.publicKey;
+  if (!publicKey) throw new Error("Solana wallet did not return a public key");
+  const address = publicKey.toString(); // base58
 
   return { chain: "solana", walletId, address, api: provider };
 }
@@ -368,14 +400,18 @@ export async function connectWallet(
 
 /**
  * Sign a message with any connected wallet.
+ *
+ * @param cardanoPayloadIsHex - pass true for withdraw message_to_sign on
+ *   Cardano (already hex-encoded by the backend). Ignored for other chains.
  */
 export async function signMessage(
   wallet: ConnectedWallet,
-  message: string
+  message: string,
+  cardanoPayloadIsHex: boolean = false
 ): Promise<string> {
   switch (wallet.chain) {
     case "cardano":
-      return signCardano(wallet.api, wallet.address, message);
+      return signCardano(wallet.api, wallet.address, message, cardanoPayloadIsHex);
     case "solana":
       return signSolana(wallet.api, message);
     case "ethereum":
@@ -385,18 +421,14 @@ export async function signMessage(
 
 // ── Helpers ──
 
-/** Decode Cardano address from hex to bech32 (simplified) */
-function decodeCardanoAddress(hex: string, networkId: number): string {
-  // For the reference app, we return the hex and let the backend decode.
-  // In production, use @emurgo/cardano-serialization-lib or similar.
-  // The backend accepts both hex and bech32 addresses.
-  try {
-    const bytes = hexToBytes(hex);
-    const prefix = networkId === 1 ? "addr" : "addr_test";
-    return bech32Encode(prefix, bytes);
-  } catch {
-    return hex; // fallback to hex
-  }
+/**
+ * Encode a CIP-30 hex address as bech32 ("addr" mainnet / "addr_test" testnet).
+ * Shelley base/enterprise addresses only (stake addresses use "stake").
+ */
+function encodeCardanoAddress(hex: string, networkId: number): string {
+  const bytes = hexToBytes(hex);
+  const prefix = networkId === 1 ? "addr" : "addr_test";
+  return bech32Encode(prefix, bytes);
 }
 
 /** Convert bech32/hex Cardano address to hex bytes for signData */

@@ -2,14 +2,18 @@ import { useState, useMemo } from "react";
 import { toast } from "react-toastify";
 import type { Position } from "../types/position";
 import type { Market } from "../types/market";
+import type { CreateOrderRequest } from "../types/order";
 import { placeOrder } from "../api/orders";
-import { formatPrice, formatCurrency, formatSignedCurrency, formatSizeForApi, snapToStep } from "../math/formatUtils";
+import { formatPrice, formatCurrency, formatSignedCurrency, formatSizeForApi, snapToStep, decimalPlaces } from "../math/formatUtils";
+import { estimateCommission, estimateBuilderFee, type FeeRates } from "../math/fees";
 
 interface Props {
   position: Position;
   market: Market | null;
   markPrice: number;
   onClose: () => void;
+  feeRates: FeeRates;
+  builderFeeBps: number;
 }
 
 /**
@@ -19,7 +23,7 @@ interface Props {
  * Side is opposite of position (LONG → sell, SHORT → buy).
  * close_position: true for full close (server closes exact remaining size).
  */
-export function ClosePositionModal({ position, market, markPrice, onClose }: Props) {
+export function ClosePositionModal({ position, market, markPrice, onClose, feeRates, builderFeeBps }: Props) {
   const [closeType, setCloseType] = useState<"market" | "limit">("market");
   const [sizePercent, setSizePercent] = useState(100);
   const [limitPrice, setLimitPrice] = useState("");
@@ -28,16 +32,21 @@ export function ClosePositionModal({ position, market, markPrice, onClose }: Pro
   const isLong = position.positionSide === "LONG";
   const closeSide = isLong ? "sell" : "buy";
   const basePrec = market?.base_prec ?? 4;
-  const stepSize = parseFloat(market?.order_market_step_size ?? market?.order_limit_step_size ?? "0.0001");
-  const tickSize = parseFloat(market?.order_tick_price ?? "0.01");
+  // Grids are anchored at the market minimum: value = min + k × step
+  const isLimit = closeType === "limit";
+  const stepSize = parseFloat((isLimit ? market?.order_limit_step_size : market?.order_market_step_size) ?? "0");
+  const minSize = parseFloat((isLimit ? market?.order_limit_min_size : market?.order_market_min_size) ?? "0");
+  const tickSize = parseFloat(market?.order_tick_price ?? "0");
+  const minPrice = parseFloat(market?.order_min_price ?? "0");
+  const pricePrec = decimalPlaces(market?.order_tick_price);
   const baseAsset = market?.base_asset ?? position.symbol.split("-")[0];
 
   // Size from slider
   const closeSize = useMemo(() => {
     if (sizePercent >= 100) return position.size;
     const raw = position.size * (sizePercent / 100);
-    return snapToStep(raw, stepSize, basePrec);
-  }, [sizePercent, position.size, stepSize, basePrec]);
+    return snapToStep(raw, stepSize, basePrec, minSize);
+  }, [sizePercent, position.size, stepSize, basePrec, minSize]);
 
   const isFullClose = closeSize >= position.size;
 
@@ -51,18 +60,21 @@ export function ClosePositionModal({ position, market, markPrice, onClose }: Pro
     return isLong ? diff * closeSize : -diff * closeSize;
   }, [markPrice, closeType, limitPrice, position.entryPrice, isLong, closeSize]);
 
-  // Estimated fee
-  const feeRate = closeType === "market" ? 0.0005 : 0.0002;
+  // Estimated fee: commission (taker for market, maker for resting limit) + builder fee
+  const feeRate = closeType === "market" ? feeRates.takerRate : feeRates.makerRate;
   const effectivePrice = closeType === "limit" && parseFloat(limitPrice) > 0
     ? parseFloat(limitPrice) : markPrice;
-  const estFee = closeSize * effectivePrice * feeRate;
+  const closeNotional = closeSize * effectivePrice;
+  const estFee =
+    estimateCommission(closeNotional, feeRate, market?.quote_prec ?? 8) +
+    estimateBuilderFee(closeNotional, builderFeeBps);
 
   const handleSubmit = async () => {
     if (closeSize <= 0) return;
     setLoading(true);
 
     try {
-      const request: any = {
+      const request: CreateOrderRequest = {
         symbol: position.symbol,
         side: closeSide,
         type: closeType,
@@ -82,11 +94,11 @@ export function ClosePositionModal({ position, market, markPrice, onClose }: Pro
           setLoading(false);
           return;
         }
-        request.price = snapToStep(price, tickSize, 2).toString();
+        request.price = snapToStep(price, tickSize, pricePrec, minPrice).toString();
         request.time_in_force = "GTC";
       }
 
-      await placeOrder(request);
+      await placeOrder(request, builderFeeBps);
       toast.success(
         isFullClose
           ? `Closing ${position.symbol} ${position.positionSide}`
@@ -187,7 +199,7 @@ export function ClosePositionModal({ position, market, markPrice, onClose }: Pro
             <span className={pnlColor}>{formatSignedCurrency(estPnL)}</span>
           </div>
           <div className="detail-row">
-            <span>Est. Fee ({(feeRate * 100).toFixed(3)}%)</span>
+            <span>Est. Fee ({(feeRate * 100).toFixed(4)}%)</span>
             <span>{formatCurrency(estFee)}</span>
           </div>
         </div>

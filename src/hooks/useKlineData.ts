@@ -121,9 +121,10 @@ export function useKlineData(symbol: string) {
       const interval = resolutionToInterval(resolution);
       const intervalMs = resolutionToSeconds(resolution) * 1000;
 
-      // Convert seconds → ms if needed (TradingView sends seconds)
+      // Convert seconds → ms if needed (TradingView sends seconds). TradingView's
+      // `to` is exclusive while the server's endTime is inclusive.
       const startTime = from < 10000000000 ? from * 1000 : from;
-      let endTime = to < 10000000000 ? to * 1000 : to;
+      let endTime = (to < 10000000000 ? to * 1000 : to) - 1;
 
       // Extend endTime for near-current requests to capture in-progress bar
       const now = Date.now();
@@ -132,17 +133,21 @@ export function useKlineData(symbol: string) {
       }
 
       const requestedRangeMs = endTime - startTime;
-      const limit = Math.min(Math.ceil(requestedRangeMs / intervalMs) + 10, 5000);
+      const limit = Math.min(Math.ceil(requestedRangeMs / intervalMs) + 10, 1500); // server max 1500
 
       console.log(`[useKlineData] getBars ${symbol} ${interval} from=${new Date(startTime).toISOString()} to=${new Date(endTime).toISOString()} limit=${limit}`);
 
       try {
-        const rawKlines = await getKlines(symbol, interval, startTime, endTime, limit);
+        // Mark-price candles: rows are [openTime, o, h, l, c, v, closeTime, ...]
+        const rawKlines = await getKlines(symbol, interval, startTime, endTime, limit, "mark");
         console.log(`[useKlineData] Got ${rawKlines.length} raw klines`);
 
+        // With endTime set the server returns the newest `limit` candles up to
+        // endTime (and may add a seed candle before an empty window), so drop
+        // anything that opened before startTime.
         const bars = rawKlines
           .map(normalizeKline)
-          .filter((b): b is ChartBar => b !== null && b.open > 0 && b.high > 0 && b.low > 0 && b.close > 0)
+          .filter((b): b is ChartBar => b !== null && b.time >= startTime && b.open > 0 && b.high > 0 && b.low > 0 && b.close > 0)
           .sort((a, b) => a.time - b.time);
 
         // Deduplicate
@@ -172,12 +177,15 @@ export function useKlineData(symbol: string) {
   /**
    * Subscribe to real-time kline updates.
    * Called by datafeed.subscribeBars().
+   * Uses the mark-price candle channel "kline_<interval>_mark" to match the
+   * REST history (priceType=mark). "kline_<interval>" is last-price candles,
+   * "kline_<interval>_index" index-price candles; all share the "kline" payload.
    */
   const subscribeToRealtimeUpdates = useCallback(
     (resolution: string, callback: (bar: ChartBar) => void): (() => void) => {
       const interval = resolutionToInterval(resolution);
       const intervalSec = resolutionToSeconds(resolution);
-      const wsChannel = `kline_${interval}`;
+      const wsChannel = `kline_${interval}_mark`;
       const callbackKey = `${symbol}:${interval}`;
 
       console.log(`[useKlineData] Subscribing WS: ${wsChannel} for ${symbol}`);
@@ -205,8 +213,9 @@ export function useKlineData(symbol: string) {
         const lastBar = lastBarPerIntervalRef.current.get(interval) ?? null;
         const intervalMs = intervalSec * 1000;
 
-        // Fill gaps and emit each bar
-        const barsToEmit = fillGaps(lastBar, newBar, intervalMs);
+        // Fill gaps and emit each bar (not for 1M: the server uses calendar
+        // months, which a fixed-length step cannot reproduce)
+        const barsToEmit = interval === "1M" ? [newBar] : fillGaps(lastBar, newBar, intervalMs);
         for (const bar of barsToEmit) {
           const cb = klineCallbacksRef.current.get(callbackKey);
           if (cb) cb(bar);

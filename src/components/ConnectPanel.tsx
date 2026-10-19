@@ -13,13 +13,15 @@ import {
   type ConnectedWallet,
   type SupportedChain,
 } from "../api/wallets";
-import { BUILDER_CODE } from "../api/config";
+import { BUILDER_CODE, BUILDER_FEE_BPS } from "../api/config";
 
 export interface ConnectedInfo {
   accountId: string;
   chain: SupportedChain;
   address: string;
   builderCode: string;
+  feeShareBps: number; // user's approved builder fee cap
+  wallet: ConnectedWallet; // kept in memory for deposit/withdraw signing
 }
 
 interface Props {
@@ -59,9 +61,10 @@ export function ConnectPanel({ onConnected, onDisconnected, connectedInfo }: Pro
       setStatus("Connecting to wallet...");
       const connected: ConnectedWallet = await connectWallet(wallet.chain, wallet.id);
 
+      // A FRESH key per connect: public keys are unique, and verify-signature
+      // revokes this account's previous API wallets for the same builder code.
       setStatus("Generating API keys...");
       const keys = generateApiWalletKeys();
-      storeApiWalletKeys(keys);
 
       setStatus("Requesting challenge...");
       const challenge = await requestSignature({
@@ -69,36 +72,37 @@ export function ConnectPanel({ onConnected, onDisconnected, connectedInfo }: Pro
         chain: connected.chain,
         publicKey: keys.publicKey,
         builderCode: builderCode.trim(),
-        maxFeeBps: 50,
+        feeShareBps: BUILDER_FEE_BPS, // approval cap the user signs (0..100 bps)
       });
 
+      // Plain-text challenge; Cardano signing hex-encodes it (backend does the same)
       setStatus("Sign the message in your wallet...");
       const walletSig = await signMessage(connected, challenge.message_to_sign);
 
       setStatus("Verifying...");
       const result = await verifySignature({
-        address: connected.address,
-        chain: connected.chain,
         nonce: challenge.nonce,
         walletSignature: walletSig,
       });
 
-      // Log the full result from verify-signature
-      console.log("[Connect] ── Builder Connect Success ──");
-      console.log("[Connect] Account ID:", result.account_id);
-      console.log("[Connect] Builder Code:", result.builder_code);
-      console.log("[Connect] Max Fee BPS:", result.max_fee_bps);
-      console.log("[Connect] API Wallet ID:", result.api_wallet_id);
-      console.log("[Connect] API Wallet Public Key:", result.api_wallet_public_key);
-      console.log("[Connect] Stored Keys PubKey:", keys.publicKey);
-      console.log("[Connect] Keys match:", result.api_wallet_public_key === keys.publicKey);
+      console.log("[Connect] Builder connect OK:", {
+        account_id: result.account_id,
+        builder_code: result.builder_code,
+        fee_share_bps: result.fee_share_bps,
+        api_wallet_id: result.api_wallet_id,
+        api_wallet_expired_at: result.api_wallet_expired_at,
+        referral: result.referral,
+      });
+      storeApiWalletKeys(keys);
 
       setStatus("");
       onConnected({
         accountId: result.account_id,
         chain: connected.chain,
         address: connected.address,
-        builderCode: builderCode.trim(),
+        builderCode: result.builder_code,
+        feeShareBps: result.fee_share_bps,
+        wallet: connected,
       });
     } catch (e: any) {
       setError(e.message || "Connection failed");
@@ -126,6 +130,10 @@ export function ConnectPanel({ onConnected, onDisconnected, connectedInfo }: Pro
           <div className="connected-row">
             <span className="text-secondary">Builder</span>
             <span className="chain-badge">{connectedInfo.builderCode}</span>
+          </div>
+          <div className="connected-row">
+            <span className="text-secondary">Max builder fee</span>
+            <span className="text-sm">{connectedInfo.feeShareBps} bps</span>
           </div>
           <div className="connected-row">
             <span className="text-secondary">Chain</span>
